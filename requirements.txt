@@ -8,3 +8,5 @@ python-dotenv==1.2.1
 onnxruntime==1.23.2
 openvino==2025.4.1
 onnxruntime-openvino==1.23.0
+lap==0.5.13
+ultralytics==8.4.0
