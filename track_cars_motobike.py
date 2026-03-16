@@ -95,8 +95,9 @@ tracked_entered_ids = set()
 last_recognized_plate = ""  # Lưu biển số nhận diện cuối cùng
 last_recognized_time = ""   # Lưu thời gian nhận diện cuối cùng
 
-def process_alpr_task(track_id, ip, user, password, snapshot_url_template, save_plates=False):
+def process_alpr_task(track_id, cam_index, ip, user, password, snapshot_url_template, save_plates=False):
     global last_recognized_plate, last_recognized_time
+    cam_track_key = (cam_index, track_id)
     if not ip:
         print("[ALPR] Chưa cấu hình IP (HKV_IP hoặc từ camera.json)")
         return
@@ -105,7 +106,7 @@ def process_alpr_task(track_id, ip, user, password, snapshot_url_template, save_
         resp = requests.get(url, auth=HTTPDigestAuth(user, password), timeout=3)
         if resp.status_code == 401:
             resp = requests.get(url, auth=HTTPBasicAuth(user, password), timeout=3)
-            
+
         if resp.status_code == 200:
             img_arr = np.frombuffer(resp.content, np.uint8)
             img = cv2.imdecode(img_arr, cv2.IMREAD_COLOR)
@@ -116,28 +117,28 @@ def process_alpr_task(track_id, ip, user, password, snapshot_url_template, save_
                     filename = f"images/plate_{timestamp}.jpg"
                     cv2.imwrite(filename, img)
                     print(f"[ALPR] Đã chụp và lưu ảnh: {filename}")
-                    
+
                 alpr = get_alpr()
                 if alpr:
                     results = alpr.predict(img)
                     if results and len(results) > 0:
                         for r in results:
                             if r.ocr and r.ocr.text:
-                                track_id_to_plate[track_id] = r.ocr.text
+                                track_id_to_plate[cam_track_key] = r.ocr.text
                                 last_recognized_plate = r.ocr.text
                                 last_recognized_time = time.strftime("%H:%M:%S %d/%m/%Y")
-                                print(f"[ALPR] Biển số: {r.ocr.text} (Xe ID {track_id}) lúc {last_recognized_time}")
+                                print(f"[ALPR] Biển số: {r.ocr.text} (Cam {cam_index+1} Xe ID {track_id}) lúc {last_recognized_time}")
                                 return
-                        
+
                         # Không có bounding box chữ nào
                         last_recognized_plate = "NO_PLATE"
                         last_recognized_time = time.strftime("%H:%M:%S %d/%m/%Y")
-                        print(f"[ALPR] Không đọc được chữ trên biển số cho xe ID {track_id}")
+                        print(f"[ALPR] Không đọc được chữ trên biển số cho Cam {cam_index+1} Xe ID {track_id}")
                     else:
                         # Hoàn toàn không tìm thấy hình dáng biển số
                         last_recognized_plate = "NO_PLATE"
                         last_recognized_time = time.strftime("%H:%M:%S %d/%m/%Y")
-                        print(f"[ALPR] Không tìm thấy biển số trong ảnh chụp cho xe ID {track_id}")
+                        print(f"[ALPR] Không tìm thấy biển số trong ảnh chụp cho Cam {cam_index+1} Xe ID {track_id}")
             else:
                 print(f"[ALPR] Lỗi giải mã ảnh chụp từ camera.")
         else:
@@ -313,7 +314,7 @@ def predict_image(model: YOLO, image_path: str, conf: float, device: str) -> lis
     return detections
 
 
-def draw_boxes(frame, results, conf_threshold: float, save_plates: bool = False, cam_info: dict = None):
+def draw_boxes(frame, results, conf_threshold: float, save_plates: bool = False, cam_info: dict = None, cam_index: int = 0):
     """Vẽ bounding box + nhãn + bộ đếm lên frame."""
     count = {name: 0 for name in VEHICLE_CLASSES.values()}
 
@@ -336,10 +337,11 @@ def draw_boxes(frame, results, conf_threshold: float, save_plates: bool = False,
 
             x1, y1, x2, y2 = map(int, box.xyxy[0])
 
+            # Kiểm tra polygon chỉ để trigger ALPR — không dùng để ẩn bounding box
             if poly_pts is not None:
                 cx = (x1 + x2) // 2
                 cy = (y1 + y2) // 2
-                
+
                 # Kiểm tra xem bounding box có giao cắt/chạm vào vùng polygon không
                 pts_to_check = [
                     (float(cx), float(y2)),  # Giữa cạnh dưới
@@ -351,13 +353,13 @@ def draw_boxes(frame, results, conf_threshold: float, save_plates: bool = False,
                     (float(x1), float(cy)),  # Giữa cạnh trái
                     (float(x2), float(cy)),  # Giữa cạnh phải
                 ]
-                
+
                 is_inside = False
                 for pt in pts_to_check:
                     if cv2.pointPolygonTest(poly_pts, pt, False) >= 0:
                         is_inside = True
                         break
-                        
+
                 # Cẩn thận thêm: Nếu polygon nằm lọt thỏm giữa bounding box
                 if not is_inside:
                     for pt in poly_pts:
@@ -365,18 +367,20 @@ def draw_boxes(frame, results, conf_threshold: float, save_plates: bool = False,
                         if x1 <= px <= x2 and y1 <= py <= y2:
                             is_inside = True
                             break
-                            
-                if not is_inside:
-                    continue
 
-                track_id = int(box.id[0]) if box.id is not None else None
-                if track_id is not None and track_id not in tracked_entered_ids:
-                    tracked_entered_ids.add(track_id)
-                    ip = cam_info.get("hkv_ip") if cam_info else HKV_IP
-                    user = cam_info.get("hkv_user") if cam_info else HKV_USER
-                    pwd = cam_info.get("hkv_pass") if cam_info else HKV_PASS
-                    snap_url = cam_info.get("hkv_snapshot_url") if cam_info else HKV_SNAPSHOT_URL
-                    alpr_executor.submit(process_alpr_task, track_id, ip, user, pwd, snap_url, save_plates)
+                # Chỉ trigger ALPR khi xe trong vùng, không skip vẽ box
+                if is_inside:
+                    track_id = int(box.id[0]) if box.id is not None else None
+                    if track_id is not None:
+                        # Bug fix: dùng (cam_index, track_id) để tránh collision giữa các camera
+                        cam_track_key = (cam_index, track_id)
+                        if cam_track_key not in tracked_entered_ids:
+                            tracked_entered_ids.add(cam_track_key)
+                            ip = cam_info.get("hkv_ip") if cam_info else HKV_IP
+                            user = cam_info.get("hkv_user") if cam_info else HKV_USER
+                            pwd = cam_info.get("hkv_pass") if cam_info else HKV_PASS
+                            snap_url = cam_info.get("hkv_snapshot_url") if cam_info else HKV_SNAPSHOT_URL
+                            alpr_executor.submit(process_alpr_task, track_id, cam_index, ip, user, pwd, snap_url, save_plates)
 
             label = VEHICLE_CLASSES[cls_id]
             color = COLOR_MAP[cls_id]
@@ -389,8 +393,9 @@ def draw_boxes(frame, results, conf_threshold: float, save_plates: bool = False,
             txt = f"{label} {conf:.2f}"
             if track_id is not None:
                 txt = f"ID:{track_id} {txt}"
-                if track_id in track_id_to_plate:
-                    txt += f" [{track_id_to_plate[track_id]}]"
+                cam_track_key = (cam_index, track_id)
+                if cam_track_key in track_id_to_plate:
+                    txt += f" [{track_id_to_plate[cam_track_key]}]"
             (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
             cv2.rectangle(frame, (x1, y1 - th - 10), (x1 + tw + 6, y1), color, -1)
             cv2.putText(frame, txt, (x1 + 3, y1 - 5),
@@ -696,7 +701,7 @@ def run_rtsp(rtsp_urls: list, model_path: str, conf: float, device: str,
         for i in range(num_cams):
             if rets[i]:
                 cfg = cam_configs[i] if cam_configs and i < len(cam_configs) else None
-                disp = draw_boxes(frames[i].copy(), last_results_list[i], conf, save_plates, cfg)
+                disp = draw_boxes(frames[i].copy(), last_results_list[i], conf, save_plates, cfg, cam_index=i)
             else:
                 disp = frames[i].copy()
                 
