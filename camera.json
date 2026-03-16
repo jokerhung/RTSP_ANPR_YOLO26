@@ -1,0 +1,28 @@
+[
+    {
+        "rtsp_url": "rtsp://admin:Vetc@2026@192.168.7.34/streaming/Channels/102",
+        "hkv_ip": "192.168.7.33",
+        "hkv_user": "admin",
+        "hkv_pass": "Vetc@2026",
+        "hkv_snapshot_url": "http://{ip}/ISAPI/Streaming/channels/1/picture",
+		"region_points": [
+            [135, 469],
+            [838, 495],
+            [880, 664],
+            [118, 638]
+        ]
+    },
+    {
+        "rtsp_url": "rtsp://admin:Vetc@2026@192.168.7.48/streaming/Channels/102",
+        "hkv_ip": "192.168.7.47",
+        "hkv_user": "admin",
+        "hkv_pass": "Vetc@2026",
+        "hkv_snapshot_url": "http://{ip}/ISAPI/Streaming/channels/1/picture",
+		"region_points": [
+            [164, 446],
+            [888, 676],
+            [884, 492],
+            [274, 315]
+        ]
+    }
+]

@@ -1,0 +1,10 @@
+open-image-models==0.5.1
+fast-plate-ocr==1.0.0
+fast-alpr==0.3.0
+paddleocr==3.3.2
+paddlepaddle==3.2.2
+psutil==7.1.3
+python-dotenv==1.2.1
+onnxruntime==1.23.2
+openvino==2025.4.1
+onnxruntime-openvino==1.23.0

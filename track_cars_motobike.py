@@ -1,0 +1,992 @@
+"""
+detect_cars_motobike.py
+Phát hiện xe ô tô, xe máy và người bằng YOLO26 + OpenVINO backend.
+
+Cách dùng:
+  python detect_cars_motobike.py                        # webcam, OpenVINO (mặc định)
+  python detect_cars_motobike.py --source video.mp4     # video file
+  python detect_cars_motobike.py --source image.jpg     # ảnh tĩnh
+  python detect_cars_motobike.py --model yolo26n.pt     # dùng PyTorch weight
+  python detect_cars_motobike.py --api                  # chạy REST API server
+  python detect_cars_motobike.py --rtsp rtsp://user:pass@192.168.1.10:554/stream  # camera RTSP
+  python detect_cars_motobike.py --rtsp "rtsp://user:pass@192.168.1.10:554/stream" --setup-region  # chon vung nhan dien
+
+LƯU Ý: Khi dùng OpenVINO IR model, device luôn là 'cpu'.
+        OpenVINO runtime tự được kích hoạt qua định dạng model, không qua device string.
+Model đã export sẵn tại: yolo26n_openvino_model/
+"""
+
+import argparse
+import os
+import time
+import threading
+import cv2
+import numpy as np
+import requests
+import ssl
+from requests.auth import HTTPBasicAuth, HTTPDigestAuth
+from concurrent.futures import ThreadPoolExecutor
+from ultralytics import YOLO
+import openvino
+import os
+
+def add_ov_libs_to_path():
+    try:
+        # Tùy thuộc vào phiên bản OpenVINO, các tệp DLL có thể nằm ở các vị trí khác nhau
+        # Ví dụ: trong môi trường ảo pip, nó nằm trong site-packages/openvino/libs/
+        ov_lib_path = os.path.join(os.path.dirname(openvino.__file__), "libs")
+        if os.path.isdir(ov_lib_path):
+            if ov_lib_path not in os.environ.get("PATH", ""):
+                os.environ["PATH"] = ov_lib_path + os.pathsep + os.environ["PATH"]
+                print(f"Đã thêm OpenVINO libs: {ov_lib_path} vào PATH.")
+            
+            # Giải quyết lỗi DLL load failed cho onnxruntime_providers_openvino trên Windows (Python >= 3.8)
+            if hasattr(os, 'add_dll_directory'):
+                os.add_dll_directory(ov_lib_path)
+                print(f"Đã gọi os.add_dll_directory cho OpenVINO libs.")
+        else:
+            print("Không cần thêm thủ công hoặc không tìm thấy thư mục libs.")
+    except Exception as e:
+        print(f"Lỗi khi thêm thủ công PATH: {e}")
+
+add_ov_libs_to_path()
+
+# Bỏ qua lỗi SSL Certificate khi fast-alpr (hoặc open-image-models) tải weights từ GitHub/HuggingFace
+try:
+    _create_unverified_https_context = ssl._create_unverified_context
+except AttributeError:
+    pass
+else:
+    ssl._create_default_https_context = _create_unverified_https_context
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+HKV_IP = os.getenv("HKV_IP", "")
+HKV_USER = os.getenv("HKV_USER", "admin")
+HKV_PASS = os.getenv("HKV_PASS", "")
+HKV_SNAPSHOT_URL = os.getenv("HKV_SNAPSHOT_URL", "http://{ip}/cgi-bin/snapshot.cgi?channel=1&subtype=0")
+
+ALPR_DETECTOR_MODEL = os.getenv("ALPR_DETECTOR_MODEL", "yolo-v9-t-384-license-plate-end2end")
+ALPR_OCR_MODEL = os.getenv("ALPR_OCR_MODEL", "cct-xs-v1-global-model")
+
+alpr_instance = None
+def get_alpr():
+    global alpr_instance
+    if alpr_instance is None:
+        try:
+            from fast_alpr import ALPR
+            alpr_instance = ALPR(
+                detector_model=ALPR_DETECTOR_MODEL,
+                ocr_model=ALPR_OCR_MODEL
+            )
+            print(f"[ALPR] Đã tải model nhận diện biển số thành công (Detector: {ALPR_DETECTOR_MODEL}, OCR: {ALPR_OCR_MODEL}).")
+        except Exception as e:
+            print(f"[ALPR] Không thể tải model: {e}")
+            alpr_instance = False
+    return alpr_instance
+
+alpr_executor = ThreadPoolExecutor(max_workers=4)
+track_id_to_plate = {}
+tracked_entered_ids = set()
+last_recognized_plate = ""  # Lưu biển số nhận diện cuối cùng
+last_recognized_time = ""   # Lưu thời gian nhận diện cuối cùng
+
+def process_alpr_task(track_id, ip, user, password, snapshot_url_template, save_plates=False):
+    global last_recognized_plate, last_recognized_time
+    if not ip:
+        print("[ALPR] Chưa cấu hình IP (HKV_IP hoặc từ camera.json)")
+        return
+    url = snapshot_url_template.format(ip=ip)
+    try:
+        resp = requests.get(url, auth=HTTPDigestAuth(user, password), timeout=3)
+        if resp.status_code == 401:
+            resp = requests.get(url, auth=HTTPBasicAuth(user, password), timeout=3)
+            
+        if resp.status_code == 200:
+            img_arr = np.frombuffer(resp.content, np.uint8)
+            img = cv2.imdecode(img_arr, cv2.IMREAD_COLOR)
+            if img is not None:
+                if save_plates:
+                    os.makedirs("images", exist_ok=True)
+                    timestamp = time.strftime("%Y%m%d_%H%M%S_") + str(int(time.time() * 1000) % 1000).zfill(3)
+                    filename = f"images/plate_{timestamp}.jpg"
+                    cv2.imwrite(filename, img)
+                    print(f"[ALPR] Đã chụp và lưu ảnh: {filename}")
+                    
+                alpr = get_alpr()
+                if alpr:
+                    results = alpr.predict(img)
+                    if results and len(results) > 0:
+                        for r in results:
+                            if r.ocr and r.ocr.text:
+                                track_id_to_plate[track_id] = r.ocr.text
+                                last_recognized_plate = r.ocr.text
+                                last_recognized_time = time.strftime("%H:%M:%S %d/%m/%Y")
+                                print(f"[ALPR] Biển số: {r.ocr.text} (Xe ID {track_id}) lúc {last_recognized_time}")
+                                return
+                        
+                        # Không có bounding box chữ nào
+                        last_recognized_plate = "NO_PLATE"
+                        last_recognized_time = time.strftime("%H:%M:%S %d/%m/%Y")
+                        print(f"[ALPR] Không đọc được chữ trên biển số cho xe ID {track_id}")
+                    else:
+                        # Hoàn toàn không tìm thấy hình dáng biển số
+                        last_recognized_plate = "NO_PLATE"
+                        last_recognized_time = time.strftime("%H:%M:%S %d/%m/%Y")
+                        print(f"[ALPR] Không tìm thấy biển số trong ảnh chụp cho xe ID {track_id}")
+            else:
+                print(f"[ALPR] Lỗi giải mã ảnh chụp từ camera.")
+        else:
+            print(f"[ALPR] Lỗi gọi API chụp ảnh: HTTP {resp.status_code}")
+    except Exception as e:
+        print(f"[ALPR] Lỗi xử lý ALPR: {e}")
+
+def load_region_points():
+    points = []
+    for key in ["REGION_A", "REGION_B", "REGION_C", "REGION_D"]:
+        val = os.getenv(key)
+        if val:
+            try:
+                x, y = map(int, val.split(","))
+                points.append([x, y])
+            except Exception:
+                pass
+    if len(points) == 4:
+        return np.array(points, np.int32).reshape((-1, 1, 2))
+    return None
+
+def save_region_points_to_env(points):
+    from dotenv import set_key
+    env_path = os.path.join(os.path.dirname(__file__), ".env")
+    for i, key in enumerate(["REGION_A", "REGION_B", "REGION_C", "REGION_D"]):
+        val = f"{points[i][0]},{points[i][1]}"
+        set_key(env_path, key, val)
+    # Cập nhật tạm thời cho biến global nếu vẫn dùng
+    global REGION_POLYGON
+    REGION_POLYGON = np.array(points, np.int32).reshape((-1, 1, 2))
+    print(f"[INFO] Đã lưu 4 điểm vào {env_path}")
+    print("[INFO] LƯU Ý: Chức năng cấu hình vùng chọn Interactive hiện chỉ ghi vào .env mặc định.")
+
+
+REGION_POLYGON = load_region_points()
+
+# ----------- Khai báo hỗ trợ setup region click chuột --------------
+mouse_points = []
+def select_points_callback(event, x, y, flags, param):
+    global mouse_points
+    if event == cv2.EVENT_LBUTTONDOWN:
+        if len(mouse_points) < 4:
+            mouse_points.append([x, y])
+            print(f"[{len(mouse_points)}/4] Chọn điểm: ({x}, {y})")
+
+def setup_region_interactively(frame, window_name="Setup Region"):
+    global mouse_points
+    mouse_points = []
+    
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback(window_name, select_points_callback)
+    
+    print("=====================================================")
+    print("Hãy click chuột trái chọn lần lượt 4 đỉnh A, B, C, D")
+    print("của vùng Polygon. Nhấn 'c' để xóa làm lại, 'Enter' để lưu.")
+    print("=====================================================")
+    
+    while True:
+        temp_frame = frame.copy()
+        
+        # Vẽ các điểm đã chọn và đường nối
+        for i, pt in enumerate(mouse_points):
+            cv2.circle(temp_frame, tuple(pt), 5, (0, 0, 255), -1)
+            cv2.putText(temp_frame, chr(ord('A') + i), (pt[0]+10, pt[1]-10), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            if i > 0:
+                cv2.line(temp_frame, tuple(mouse_points[i-1]), tuple(pt), (255, 0, 0), 2)
+        if len(mouse_points) == 4:
+            cv2.line(temp_frame, tuple(mouse_points[3]), tuple(mouse_points[0]), (255, 0, 0), 2)
+            cv2.putText(temp_frame, "Da du 4 diem. Nhan Enter de luu hoac 'c' de xoa", 
+                        (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+            
+        cv2.imshow(window_name, temp_frame)
+        key = cv2.waitKey(20) & 0xFF
+        
+        if key == ord('c'):
+            mouse_points.clear()
+            print("Đã xóa làm lại.")
+        elif key == 13 or key == ord('\r'): # Enter key
+            if len(mouse_points) == 4:
+                save_region_points_to_env(mouse_points)
+                cv2.destroyWindow(window_name)
+                break
+            else:
+                print("Lỗi: Phải chọn đủ 4 điểm mới có thể lưu!")
+                
+    return True
+# ---------------------------------------------------------------------------
+
+# COCO class IDs cần detect
+VEHICLE_CLASSES = {
+    #1: "bicycle",
+    2: "car",
+    #3: "motorcycle",
+    #5: "bus",
+    #7: "truck",
+}
+
+COLOR_MAP = {
+    #1: (0, 215, 255),   # vàng     – xe đạp
+    2: (0, 200, 80),    # xanh lá  – ô tô
+    #3: (0, 140, 255),   # cam      – xe máy
+    #5: (255, 60, 0),    # xanh dương – xe buýt
+    #7: (20, 20, 220),   # đỏ       – xe tải
+}
+
+DEFAULT_MODEL = "yolo26n_openvino_model"   # OpenVINO IR (đã export sẵn)
+DEFAULT_PT    = "yolo26n.pt"               # PyTorch weight (fallback)
+
+
+# ---------------------------------------------------------------------------
+# Core
+# ---------------------------------------------------------------------------
+
+def load_model(model_path: str) -> YOLO:
+    # Chỉ định task='detect' để tránh warning khi load OpenVINO IR model
+    model = YOLO(model_path, task="detect")
+    return model
+
+
+def get_device(model_path: str, requested_device: str) -> str:
+    """
+    Khi model là OpenVINO IR (thư mục):
+      - 'cpu'  → OpenVINO CPU plugin
+      - 'GPU'  → OpenVINO GPU plugin (Intel iGPU/dGPU) — giải phóng CPU
+      - 'AUTO' → OpenVINO tự chọn device nhanh nhất
+    Khi model là .pt PyTorch: dùng requested_device nguyên.
+    """
+    if os.path.isdir(model_path):
+        d = requested_device.upper()
+        if d in ("GPU", "AUTO", "NPU", "CPU"):
+            return f"intel:{d}"  # Ultralytics 8.4+ OpenVINO syntax
+        return "intel:AUTO"  # Mặc định dùng intel:AUTO để an toàn
+    return requested_device
+
+
+def predict_image(model: YOLO, image_path: str, conf: float, device: str) -> list:
+    """
+    Detect objects trong một ảnh, trả về list detection dạng dict.
+    Dùng cho cả REST API và hiển thị CLI.
+    """
+    frame = cv2.imread(image_path)
+    if frame is None:
+        raise FileNotFoundError(f"Không đọc được ảnh: {image_path}")
+
+    results = model.predict(
+        source=frame,
+        classes=list(VEHICLE_CLASSES.keys()),
+        conf=conf,
+        device=device,
+        verbose=False,
+    )
+
+    detections = []
+    for result in results:
+        for box in result.boxes:
+            cls_id = int(box.cls[0])
+            confidence = float(box.conf[0])
+            if cls_id not in VEHICLE_CLASSES:
+                continue
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            detections.append({
+                "class_id":   cls_id,
+                "class_name": VEHICLE_CLASSES[cls_id],
+                "confidence": round(confidence, 4),
+                "bbox": {
+                    "x1": x1, "y1": y1,
+                    "x2": x2, "y2": y2,
+                    "width":  x2 - x1,
+                    "height": y2 - y1,
+                },
+            })
+    return detections
+
+
+def draw_boxes(frame, results, conf_threshold: float, save_plates: bool = False, cam_info: dict = None):
+    """Vẽ bounding box + nhãn + bộ đếm lên frame."""
+    count = {name: 0 for name in VEHICLE_CLASSES.values()}
+
+    # Lấy vùng Polygon ưu tiên từ camera config, fallback xuống .env
+    poly_pts = None
+    if cam_info and "region_points" in cam_info and len(cam_info["region_points"]) == 4:
+        poly_pts = np.array(cam_info["region_points"], np.int32).reshape((-1, 1, 2))
+    else:
+        poly_pts = REGION_POLYGON
+
+    if poly_pts is not None:
+        cv2.polylines(frame, [poly_pts], isClosed=True, color=(255, 0, 255), thickness=2)
+
+    for result in results:
+        for box in result.boxes:
+            cls_id = int(box.cls[0])
+            conf   = float(box.conf[0])
+            if cls_id not in VEHICLE_CLASSES or conf < conf_threshold:
+                continue
+
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+
+            if poly_pts is not None:
+                cx = (x1 + x2) // 2
+                cy = (y1 + y2) // 2
+                
+                # Kiểm tra xem bounding box có giao cắt/chạm vào vùng polygon không
+                pts_to_check = [
+                    (float(cx), float(y2)),  # Giữa cạnh dưới
+                    (float(cx), float(cy)),  # Tâm điểm
+                    (float(x1), float(y2)),  # Góc dưới trái
+                    (float(x2), float(y2)),  # Góc dưới phải
+                    (float(x1), float(y1)),  # Góc trên trái
+                    (float(x2), float(y1)),  # Góc trên phải
+                    (float(x1), float(cy)),  # Giữa cạnh trái
+                    (float(x2), float(cy)),  # Giữa cạnh phải
+                ]
+                
+                is_inside = False
+                for pt in pts_to_check:
+                    if cv2.pointPolygonTest(poly_pts, pt, False) >= 0:
+                        is_inside = True
+                        break
+                        
+                # Cẩn thận thêm: Nếu polygon nằm lọt thỏm giữa bounding box
+                if not is_inside:
+                    for pt in poly_pts:
+                        px, py = pt[0]
+                        if x1 <= px <= x2 and y1 <= py <= y2:
+                            is_inside = True
+                            break
+                            
+                if not is_inside:
+                    continue
+
+                track_id = int(box.id[0]) if box.id is not None else None
+                if track_id is not None and track_id not in tracked_entered_ids:
+                    tracked_entered_ids.add(track_id)
+                    ip = cam_info.get("hkv_ip") if cam_info else HKV_IP
+                    user = cam_info.get("hkv_user") if cam_info else HKV_USER
+                    pwd = cam_info.get("hkv_pass") if cam_info else HKV_PASS
+                    snap_url = cam_info.get("hkv_snapshot_url") if cam_info else HKV_SNAPSHOT_URL
+                    alpr_executor.submit(process_alpr_task, track_id, ip, user, pwd, snap_url, save_plates)
+
+            label = VEHICLE_CLASSES[cls_id]
+            color = COLOR_MAP[cls_id]
+            count[label] += 1
+
+            track_id = int(box.id[0]) if box.id is not None else None
+
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+            txt = f"{label} {conf:.2f}"
+            if track_id is not None:
+                txt = f"ID:{track_id} {txt}"
+                if track_id in track_id_to_plate:
+                    txt += f" [{track_id_to_plate[track_id]}]"
+            (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+            cv2.rectangle(frame, (x1, y1 - th - 10), (x1 + tw + 6, y1), color, -1)
+            cv2.putText(frame, txt, (x1 + 3, y1 - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+    # Bảng đếm góc trên-trái
+    overlay = frame.copy()
+    
+    # Tính toán chiều cao vùng đen dựa trên việc có biển số hay không
+    bg_height = 25 * len(count) + 15
+    if last_recognized_plate:
+        bg_height += 60 # Thêm không gian cho biển số và timestamp
+        
+    cv2.rectangle(overlay, (0, 0), (220, bg_height), (20, 20, 20), -1)
+    frame = cv2.addWeighted(overlay, 0.55, frame, 0.45, 0)
+
+    y = 28
+    for name, cnt in count.items():
+        color = next(c for k, c in COLOR_MAP.items() if VEHICLE_CLASSES[k] == name)
+        cv2.putText(frame, f"  {name}: {cnt}", (5, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2)
+        y += 25
+        
+    if last_recognized_plate:
+        y += 5
+        cv2.putText(frame, f"  BS: {last_recognized_plate}", (5, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        y += 25
+        cv2.putText(frame, f"  {last_recognized_time}", (5, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+
+    return frame
+
+
+def run(source, model_path: str, conf: float, device: str):
+    """Chạy detect theo thời gian thực (webcam / video / ảnh tĩnh)."""
+    print(f"[INFO] Nạp model: {model_path}")
+    model = load_model(model_path)
+    device = get_device(model_path, device)
+    backend = "OpenVINO" if os.path.isdir(model_path) else f"PyTorch ({device})"
+    print(f"[INFO] Backend: {backend} | Conf ≥ {conf}")
+
+    src = 0 if source in ("0", 0) else source
+    is_image = isinstance(src, str) and src.lower().endswith(
+        (".jpg", ".jpeg", ".png", ".bmp", ".webp")
+    )
+
+    if is_image:
+        detections = predict_image(model, src, conf, device)
+        frame = cv2.imread(src)
+        results = model.predict(
+            source=frame, classes=list(VEHICLE_CLASSES.keys()),
+            conf=conf, device=device, verbose=False,
+        )
+        frame = draw_boxes(frame, results, conf)
+        cv2.imshow("YOLO26 - OpenVINO", frame)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+        return
+
+    # --- Video / Webcam ---
+    cap = cv2.VideoCapture(src)
+    if not cap.isOpened():
+        print(f"[ERROR] Không mở được nguồn: {source}")
+        return
+
+    print("[INFO] Nhấn 'q' để thoát | 's' để chụp màn hình")
+    shot_idx = 0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        results = model.predict(
+            source=frame,
+            classes=list(VEHICLE_CLASSES.keys()),
+            conf=conf,
+            device=device,
+            verbose=False,
+        )
+
+        frame = draw_boxes(frame, results, conf)
+
+        h, w = frame.shape[:2]
+        cv2.putText(frame, "YOLO26 + OpenVINO", (w - 240, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 200), 2)
+
+        cv2.imshow("YOLO26 - Cars & Motorbikes | OpenVINO", frame)
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("q"):
+            break
+        if key == ord("s"):
+            name = f"screenshot_{shot_idx:04d}.jpg"
+            cv2.imwrite(name, frame)
+            print(f"[INFO] Đã lưu: {name}")
+            shot_idx += 1
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+# ---------------------------------------------------------------------------
+# RTSP Realtime Detection
+# ---------------------------------------------------------------------------
+
+class RTSPReader:
+    """
+    Đọc frame từ RTSP stream trong một thread riêng.
+    Giải quyết vấn đề buffer lag: chỉ giữ frame mới nhất,
+    bỏ qua các frame cũ chưa kịp xử lý.
+    """
+    def __init__(self, url: str, reconnect_delay: float = 3.0, read_fps: float = 60.0):
+        self.url             = url
+        self.reconnect_delay = reconnect_delay
+        self._frame          = None
+        self._lock           = threading.Lock()
+        self._running        = False
+        self._thread         = None
+        self.connected       = False
+
+    def start(self):
+        self._running = True
+        self._thread  = threading.Thread(target=self._read_loop, daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self):
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=5)
+
+    def read(self):
+        """Trả về (True, frame) nếu có, ngược lại (False, None)."""
+        with self._lock:
+            if self._frame is None:
+                return False, None
+            return True, self._frame.copy()
+
+    def _read_loop(self):
+        # ----------------------------------------------------------------
+        # TCP transport + thử hardware decode (Intel DXVA2/QSV trên Windows)
+        # Software decode H264 1080p ~25fps có thể chiếm 40-80% 1 core CPU.
+        # Hardware decode chuyển việc đó sang GPU/iGPU → CPU gần bằng 0.
+        # ----------------------------------------------------------------
+        hw_options = [
+            # Ưu tiên 1: Intel QuickSync (iGPU Intel Arc/Iris)
+            "rtsp_transport;tcp|video_codec;h264_qsv|hwaccel;qsv",
+            # Ưu tiên 2: DirectX Video Acceleration (Windows generic)
+            "rtsp_transport;tcp|hwaccel;dxva2",
+            # Fallback: software decode thuần CPU (đã dùng trước đây)
+            "rtsp_transport;tcp",
+        ]
+
+        for hw_opt in hw_options:
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = hw_opt
+            cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
+            if cap.isOpened():
+                label = hw_opt.split("|")[0].replace("rtsp_transport;tcp", "TCP")
+                hwaccel = hw_opt.split("hwaccel;")[-1] if "hwaccel" in hw_opt else "software"
+                print(f"[RTSP] Kết nối OK | decode={hwaccel}")
+                break
+            cap.release()
+        else:
+            # Tất cả đều thất bại
+            print(f"[RTSP] Không kết nối được: {self.url} → thử lại sau {self.reconnect_delay}s")
+            print(f"[RTSP] Gợi ý: Đảm bảo URL trong ngoặc kép khi chạy lệnh")
+            self.connected = False
+            time.sleep(self.reconnect_delay)
+            return
+
+        # Giảm buffer còn 1 frame → không tích lũy frame cũ
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.connected = True
+
+        while self._running:
+            # Liên tục đọc để tránh nghẽn luồng RTSP gây nhòe hoặc lỗi ffmpeg "error while decoding"
+            ret, frame = cap.read()
+            if not ret:
+                print("[RTSP] Mất kết nối, đang tự kết nối lại...")
+                self.connected = False
+                cap.release()
+                time.sleep(self.reconnect_delay)
+                # Gọi đệ quy để thử lại từ đầu (kể cả thử lại hw decode)
+                self._read_loop()
+                return
+
+            with self._lock:
+                self._frame = frame
+
+        cap.release()
+
+
+def run_rtsp(rtsp_urls: list, model_path: str, conf: float, device: str,
+             reconnect_delay: float = 3.0, max_fps: float = 15.0,
+             skip_frames: int = 1, infer_size: int = 640, save_plates: bool = False,
+             cam_configs: list = None):
+    """
+    Nhận dạng realtime từ nhiều camera RTSP (tối đa 4 stream song song).
+    skip_frames : chỉ inference 1 trong mỗi skip_frames frame (giảm CPU)
+    infer_size  : resize frame xuống trước inference (mặc định 640)
+    """
+    import numpy as np
+    if len(rtsp_urls) > 4:
+        print("[WARNING] Chỉ hỗ trợ tối đa 4 camera đồng thời. Lấy 4 URL đầu tiên.")
+        rtsp_urls = rtsp_urls[:4]
+
+    num_cams = len(rtsp_urls)
+    print(f"[INFO] Nạp model: {model_path} cho {num_cams} camera")
+    models = [load_model(model_path) for _ in range(num_cams)]
+    device = get_device(model_path, device)
+    backend = "OpenVINO" if os.path.isdir(model_path) else f"PyTorch ({device})"
+    print(f"[INFO] Backend: {backend} | Device: {device} | Conf ≥ {conf}")
+    print(f"[INFO] Max FPS: {max_fps} | Skip: 1/{skip_frames} frames | Size: {infer_size}")
+    for i, u in enumerate(rtsp_urls):
+        print(f"[INFO] Cam {i+1} RTSP URL: {u}")
+    print("[INFO] Phím: 'q' thoát | 's' chụp màn hình")
+
+    readers = [RTSPReader(url, reconnect_delay=reconnect_delay, read_fps=max_fps).start() for url in rtsp_urls]
+
+    frame_interval  = 1.0 / max(max_fps, 1)
+    fps_timer       = time.perf_counter()
+    fps_count       = 0
+    fps_display     = 0.0
+    shot_idx        = 0
+    frame_counter   = 0
+    last_results_list = [[] for _ in range(num_cams)]
+    grid_w, grid_h = 960, 540
+
+    setup_done = False if args.setup_region else True
+
+    while True:
+        frames = []
+        rets = []
+        for reader in readers:
+            ret, frame = reader.read()
+            rets.append(ret)
+            if ret:
+                frames.append(frame)
+            else:
+                blank = np.zeros((grid_h, grid_w, 3), dtype='uint8')
+                status = "Dang ket noi..." if not reader.connected else "Cho frame..."
+                cv2.putText(blank, status, (grid_w//2 - 100, grid_h//2), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2)
+                frames.append(blank)
+
+        if not any(rets):
+            grid_frames = [f if f.shape[:2] == (grid_h, grid_w) else cv2.resize(f, (grid_w, grid_h)) for f in frames]
+            while len(grid_frames) < 4:
+                grid_frames.append(np.zeros((grid_h, grid_w, 3), dtype='uint8'))
+                
+            if num_cams == 1:
+                final_display = frames[0]
+            else:
+                top_row = np.hstack((grid_frames[0], grid_frames[1]))
+                bottom_row = np.hstack((grid_frames[2], grid_frames[3]))
+                final_display = np.vstack((top_row, bottom_row))
+                
+            cv2.namedWindow("YOLO26 Multi-RTSP | OpenVINO", cv2.WINDOW_NORMAL)
+            cv2.imshow("YOLO26 Multi-RTSP | OpenVINO", final_display)
+            if cv2.waitKey(200) & 0xFF == ord("q"):
+                break
+            continue
+
+        if not setup_done and sum(rets) >= 1:
+            # Lấy frame cam đầu tiên để setup
+            setup_frame = None
+            for i, r in enumerate(rets):
+                if r:
+                    setup_frame = frames[i]
+                    break
+            
+            if num_cams > 1:
+               # Nếu nhiều cam thì setup trên frame tổng
+               grid_frames = [f if f.shape[:2] == (grid_h, grid_w) else cv2.resize(f, (grid_w, grid_h)) for f in frames]
+               while len(grid_frames) < 4:
+                   grid_frames.append(np.zeros((grid_h, grid_w, 3), dtype='uint8'))
+               top_row = np.hstack((grid_frames[0], grid_frames[1]))
+               bottom_row = np.hstack((grid_frames[2], grid_frames[3]))
+               setup_frame = np.vstack((top_row, bottom_row))
+
+            setup_region_interactively(setup_frame, window_name="Setup Region (Enter to save)")
+            setup_done = True
+            
+            # Flush existing keys
+            cv2.waitKey(1)
+            continue
+
+        frame_counter += 1
+        t_frame_start  = time.perf_counter()
+
+        # ---------- Inference chỉ mỗi skip_frames frame ----------
+        if frame_counter % skip_frames == 0:
+            for i in range(num_cams):
+                if rets[i]:
+                    last_results_list[i] = models[i].track(
+                        source=frames[i], imgsz=infer_size, classes=list(VEHICLE_CLASSES.keys()),
+                        conf=conf, device=device, verbose=False,
+                        persist=True, tracker="bytetrack.yaml"
+                    )
+
+        # ---------- Draw boxes & Overlay ----------
+        displays = []
+        for i in range(num_cams):
+            if rets[i]:
+                cfg = cam_configs[i] if cam_configs and i < len(cam_configs) else None
+                disp = draw_boxes(frames[i].copy(), last_results_list[i], conf, save_plates, cfg)
+            else:
+                disp = frames[i].copy()
+                
+            h, w = disp.shape[:2]
+            cv2.rectangle(disp, (0, 0), (min(w, 350), 38), (20, 20, 20), -1)
+            cv2.putText(disp, f"Cam {i+1} | YOLO26", (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 200), 2)
+            
+            conn_txt   = "CONNECTED" if readers[i].connected else "RECONNECTING..."
+            conn_color = (0, 200, 80) if readers[i].connected else (0, 80, 255)
+            cv2.putText(disp, conn_txt, (10, h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.6, conn_color, 2)
+            displays.append(disp)
+
+        # ---------- Grid Display ----------
+        if num_cams == 1:
+            final_display = displays[0]
+        else:
+            grid_frames = [cv2.resize(d, (grid_w, grid_h)) for d in displays]
+            while len(grid_frames) < 4:
+                grid_frames.append(np.zeros((grid_h, grid_w, 3), dtype='uint8'))
+                
+            top_row = np.hstack((grid_frames[0], grid_frames[1]))
+            bottom_row = np.hstack((grid_frames[2], grid_frames[3]))
+            final_display = np.vstack((top_row, bottom_row))
+
+        # ---------- FPS ----------
+        fps_count += 1
+        elapsed_total = time.perf_counter() - fps_timer
+        if elapsed_total >= 1.0:
+            fps_display = fps_count / elapsed_total
+            fps_count   = 0
+            fps_timer   = time.perf_counter()
+
+        fh, fw = final_display.shape[:2]
+        cv2.putText(final_display, f"Total FPS: {fps_display:.1f}", (fw - 180, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 215, 255), 2)
+
+        # ---------- Throttle ----------
+        elapsed_frame = time.perf_counter() - t_frame_start
+        if elapsed_frame < frame_interval:
+            time.sleep(frame_interval - elapsed_frame)
+
+        cv2.namedWindow("YOLO26 Multi-RTSP | OpenVINO", cv2.WINDOW_NORMAL)
+        cv2.imshow("YOLO26 Multi-RTSP | OpenVINO", final_display)
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("q"):
+            break
+        if key == ord("s"):
+            name = f"rtsp_shot_{shot_idx:04d}.jpg"
+            cv2.imwrite(name, final_display)
+            print(f"[INFO] Đã lưu: {name}")
+            shot_idx += 1
+
+    for reader in readers:
+        reader.stop()
+    cv2.destroyAllWindows()
+    print("[INFO] Đã dừng RTSP detection.")
+
+
+# ---------------------------------------------------------------------------
+# REST API  (FastAPI + uvicorn)
+# ---------------------------------------------------------------------------
+
+def run_api(model_path: str, conf: float, device: str, host: str, port: int):
+    """Khởi động FastAPI server."""
+    try:
+        from fastapi import FastAPI, HTTPException
+        from fastapi.responses import JSONResponse
+        from pydantic import BaseModel
+        import uvicorn
+    except ImportError:
+        print("[ERROR] Chưa cài fastapi/uvicorn. Chạy: pip install fastapi uvicorn[standard]")
+        return
+
+    device = get_device(model_path, device)
+    backend = "OpenVINO" if os.path.isdir(model_path) else f"PyTorch ({device})"
+
+    print(f"[INFO] Nạp model: {model_path} | Backend: {backend}")
+    model = load_model(model_path)
+    print(f"[INFO] API server: http://{host}:{port}")
+
+    app = FastAPI(
+        title="YOLO26 Detection API",
+        description="Phát hiện xe và người bằng YOLO26 + OpenVINO",
+        version="1.0.0",
+    )
+
+    # ---- Request / Response schema ----
+    # Pydantic class body không thể dùng biến local của function cha trực tiếp
+    _default_conf = conf
+
+    class DetectRequest(BaseModel):
+        image_path: str               # Đường dẫn tuyệt đối hoặc tương đối tới ảnh
+        conf: float = _default_conf   # Ghi đè confidence per-request (tùy chọn)
+
+    class BBox(BaseModel):
+        x1: int
+        y1: int
+        x2: int
+        y2: int
+        width: int
+        height: int
+
+    class Detection(BaseModel):
+        class_id:   int
+        class_name: str
+        confidence: float
+        bbox: BBox
+
+    class DetectResponse(BaseModel):
+        image_path:          str
+        total:               int
+        counts:              dict
+        processing_time_ms:  float
+        detections:          list[Detection]
+
+    # ---- Endpoints ----
+
+    @app.get("/")
+    def root():
+        return {
+            "service": "YOLO26 Detection API",
+            "backend": backend,
+            "model":   model_path,
+            "classes": VEHICLE_CLASSES,
+            "endpoints": {
+                "POST /detect": "Detect objects trong ảnh",
+                "GET  /health": "Kiểm tra server",
+            },
+        }
+
+    @app.get("/health")
+    def health():
+        return {"status": "ok", "model": model_path, "backend": backend}
+
+    @app.post("/detect", response_model=DetectResponse)
+    def detect(req: DetectRequest):
+        if not os.path.isfile(req.image_path):
+            raise HTTPException(
+                status_code=404,
+                detail=f"Không tìm thấy file: {req.image_path}",
+            )
+
+        try:
+            t0 = time.perf_counter()
+            detections = predict_image(model, req.image_path, req.conf, device)
+            elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+        # Tổng hợp số lượng theo class
+        counts: dict = {}
+        for d in detections:
+            counts[d["class_name"]] = counts.get(d["class_name"], 0) + 1
+
+        return DetectResponse(
+            image_path=req.image_path,
+            total=len(detections),
+            counts=counts,
+            processing_time_ms=elapsed_ms,
+            detections=detections,
+        )
+
+    uvicorn.run(app, host=host, port=port, log_level="info")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="YOLO26 - Detect Cars, Motorbikes & Persons với OpenVINO"
+    )
+    parser.add_argument("--api",    action="store_true",
+                        help="Chạy REST API server (FastAPI)")
+    parser.add_argument("--host",   type=str,  default="0.0.0.0",
+                        help="API host (mặc định: 0.0.0.0)")
+    parser.add_argument("--port",   type=int,  default=8000,
+                        help="API port (mặc định: 8000)")
+    parser.add_argument("--rtsp",   type=str,  default=None,
+                        help="URL camera RTSP (hỗ trợ nhiều URL, phân cách bằng dấu phẩy)")
+    parser.add_argument("--reconnect-delay", type=float, default=3.0,
+                        help="Thời gian chờ trước khi kết nối lại RTSP (giây, mặc định: 3.0)")
+    parser.add_argument("--max-fps", type=float, default=15.0,
+                        help="FPS tối đa cho RTSP inference, giảm để giảm CPU (mặc định: 15)")
+    parser.add_argument("--source", type=str,  default="0",
+                        help="Nguồn video: '0' webcam | đường dẫn video/ảnh (bỏ qua khi --api hoặc --rtsp)")
+    parser.add_argument("--model",  type=str,  default=DEFAULT_MODEL,
+                        help=f"Model path (mặc định: {DEFAULT_MODEL})")
+    parser.add_argument("--conf",   type=float, default=0.45,
+                        help="Ngưỡng confidence (mặc định: 0.45)")
+    parser.add_argument("--device", type=str,  default="GPU",
+                        help="Device: 'cpu' | 'GPU' | 'AUTO' (với OpenVINO IR model, mặc định: GPU)")
+    parser.add_argument("--skip-frames", type=int, default=2,
+                        help="Inference 1/N frame để giảm CPU (mặc định: 2 = bỏ qua 1 frame)")
+    parser.add_argument("--infer-size", type=int, default=640,
+                        help="Resize ảnh trước inference (mặc định: 640, giảm xuống 320 để giảm CPU)")
+    parser.add_argument("--setup-region", action="store_true",
+                        help="Hiện UI tương tác để click 4 điểm vẽ vùng nhận diện, lưu vào .env")
+    parser.add_argument("--save-plates", action="store_true",
+                        help="Lưu ảnh chụp từ ALPR vào thư mục 'images'")
+    parser.add_argument("--test-snapshot", action="store_true",
+                        help="Test HTTP API chụp ảnh từ Hikvision, lưu ra file snapshot_test.jpg và thoát")
+    parser.add_argument("--test-alpr", type=str, default="",
+                        help="Test đọc biển số từ file ảnh chỉ định (--test-alpr path/to/img.jpg) và thoát")
+    args = parser.parse_args()
+
+    if args.test_snapshot:
+        print(f"[*] Đang test chụp ảnh Snapshot từ {HKV_IP}...")
+        url = HKV_SNAPSHOT_URL.format(ip=HKV_IP)
+        try:
+            resp = requests.get(url, auth=HTTPDigestAuth(HKV_USER, HKV_PASS), timeout=5)
+            if resp.status_code == 401:
+                resp = requests.get(url, auth=HTTPBasicAuth(HKV_USER, HKV_PASS), timeout=5)
+            if resp.status_code == 200:
+                with open("snapshot_test.jpg", "wb") as f:
+                    f.write(resp.content)
+                print("[OK] Đã chụp thành công và lưu vào snapshot_test.jpg")
+            else:
+                print(f"[FAIL] Lỗi gọi API chụp ảnh: HTTP {resp.status_code}")
+        except Exception as e:
+            print(f"[ERROR] Quá trình test snapshot bị lỗi: {e}")
+        exit(0)
+
+    if args.test_alpr:
+        img_path = args.test_alpr
+        print(f"[*] Đang test đọc biển số từ ảnh: {img_path}")
+        if not os.path.exists(img_path):
+            print(f"[ERROR] Không tìm thấy file: {img_path}")
+            exit(1)
+        
+        img = cv2.imread(img_path)
+        if img is None:
+            print(f"[ERROR] Không thể đọc được ảnh (hỏng file): {img_path}")
+            exit(1)
+            
+        alpr = get_alpr()
+        if not alpr:
+            print("[ERROR] Init fast_alpr thất bại.")
+            exit(1)
+            
+        alpr_results  = alpr.predict(img)
+        print(alpr_results )
+        if alpr_results  and len(alpr_results ) > 0:
+            for i, r in enumerate(alpr_results ):
+                text = r.ocr.text if r.ocr else "N/A"
+                print(f"  -> Biển số [{i+1}]: {text}")
+                
+            # Vẽ ra kết quả
+            img_drawn = alpr.draw_predictions(img)
+            cv2.imshow("Test ALPR", img_drawn)
+            print("[INFO] Nhấn phím bất kỳ (trên cửa sổ ảnh) để thoát...")
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()
+        else:
+            print("[FAILED] Không nhận diện được biển số nào từ ảnh này.")
+        exit(0)
+
+    if args.rtsp:
+        cam_configs_json = None
+        if args.rtsp.endswith(".json") and os.path.exists(args.rtsp):
+            import json
+            with open(args.rtsp, 'r', encoding='utf-8') as f:
+                cam_configs_json = json.load(f)
+            rtsp_list = [cam.get("rtsp_url") for cam in cam_configs_json if cam.get("rtsp_url")]
+        else:
+            rtsp_list = [url.strip() for url in args.rtsp.split(",") if url.strip()]
+            
+        run_rtsp(
+            rtsp_urls       = rtsp_list,
+            model_path      = args.model,
+            conf            = args.conf,
+            device          = args.device,
+            reconnect_delay = args.reconnect_delay,
+            max_fps         = args.max_fps,
+            skip_frames     = args.skip_frames,
+            infer_size      = args.infer_size,
+            save_plates     = args.save_plates,
+            cam_configs     = cam_configs_json
+        )
+    elif args.api:
+        run_api(
+            model_path=args.model,
+            conf=args.conf,
+            device=args.device,
+            host=args.host,
+            port=args.port,
+        )
+    else:
+        run(
+            source=args.source,
+            model_path=args.model,
+            conf=args.conf,
+            device=args.device,
+        )
