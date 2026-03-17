@@ -348,9 +348,13 @@ def predict_image(model: YOLO, image_path: str, conf: float, device: str) -> lis
     return detections
 
 
-def draw_boxes(frame, results, conf_threshold: float, save_plates: bool = False, cam_info: dict = None, cam_index: int = 0):
+def draw_boxes(frame, results, conf_threshold: float, save_plates: bool = False,
+               cam_info: dict = None, cam_index: int = 0, min_box_height: int = 0):
     """Vẽ bounding box + nhãn + bộ đếm lên frame."""
     count = {name: 0 for name in VEHICLE_CLASSES.values()}
+
+    # min_box_height ưu tiên từ camera config, fallback xuống tham số truyền vào
+    _min_h = cam_info.get("min_box_height", min_box_height) if cam_info else min_box_height
 
     # Lấy vùng Polygon ưu tiên từ camera config, fallback xuống .env
     poly_pts = None
@@ -370,6 +374,10 @@ def draw_boxes(frame, results, conf_threshold: float, save_plates: bool = False,
                 continue
 
             x1, y1, x2, y2 = map(int, box.xyxy[0])
+
+            # Lọc xe xa: bỏ qua box có chiều cao nhỏ hơn ngưỡng tối thiểu
+            if _min_h > 0 and (y2 - y1) < _min_h:
+                continue
 
             # Kiểm tra polygon chỉ để trigger ALPR — không dùng để ẩn bounding box
             if poly_pts is not None:
@@ -633,11 +641,12 @@ class RTSPReader:
 def run_rtsp(rtsp_urls: list, model_path: str, conf: float, device: str,
              reconnect_delay: float = 3.0, max_fps: float = 15.0,
              skip_frames: int = 1, infer_size: int = 640, save_plates: bool = False,
-             cam_configs: list = None):
+             cam_configs: list = None, min_box_height: int = 0):
     """
     Nhận dạng realtime từ nhiều camera RTSP (tối đa 4 stream song song).
-    skip_frames : chỉ inference 1 trong mỗi skip_frames frame (giảm CPU)
-    infer_size  : resize frame xuống trước inference (mặc định 640)
+    skip_frames    : chỉ inference 1 trong mỗi skip_frames frame (giảm CPU)
+    infer_size     : resize frame xuống trước inference (mặc định 640)
+    min_box_height : bỏ qua xe có bounding box nhỏ hơn N pixel (0 = không lọc)
     """
     import numpy as np
     if len(rtsp_urls) > 4:
@@ -742,7 +751,8 @@ def run_rtsp(rtsp_urls: list, model_path: str, conf: float, device: str,
         for i in range(num_cams):
             if rets[i]:
                 cfg = cam_configs[i] if cam_configs and i < len(cam_configs) else None
-                disp = draw_boxes(frames[i].copy(), last_results_list[i], conf, save_plates, cfg, cam_index=i)
+                disp = draw_boxes(frames[i].copy(), last_results_list[i], conf, save_plates, cfg,
+                                  cam_index=i, min_box_height=min_box_height)
             else:
                 disp = frames[i].copy()
                 
@@ -938,6 +948,9 @@ if __name__ == "__main__":
                         help="Inference 1/N frame để giảm CPU (mặc định: 2 = bỏ qua 1 frame)")
     parser.add_argument("--infer-size", type=int, default=640,
                         help="Resize ảnh trước inference (mặc định: 640, giảm xuống 320 để giảm CPU)")
+    parser.add_argument("--min-box-height", type=int, default=0,
+                        help="Bỏ qua xe có bounding box cao < N pixel – lọc xe xa (mặc định: 0 = không lọc). "
+                             "Có thể cấu hình riêng từng làn qua 'min_box_height' trong camera.json")
     parser.add_argument("--setup-region", action="store_true",
                         help="Hiện UI tương tác để click 4 điểm vẽ vùng nhận diện, lưu vào .env")
     parser.add_argument("--save-plates", action="store_true",
@@ -1019,7 +1032,8 @@ if __name__ == "__main__":
             skip_frames     = args.skip_frames,
             infer_size      = args.infer_size,
             save_plates     = args.save_plates,
-            cam_configs     = cam_configs_json
+            cam_configs     = cam_configs_json,
+            min_box_height  = args.min_box_height,
         )
     elif args.api:
         run_api(

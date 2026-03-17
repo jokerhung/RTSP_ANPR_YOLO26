@@ -12,7 +12,8 @@
             [118, 638]
         ],
         "socket_ip": "192.168.7.100",
-        "socket_port": 9000
+        "socket_port": 9000,
+        "min_box_height": 80
     },
     {
         "rtsp_url": "rtsp://admin:Vetc@2026@192.168.7.48/streaming/Channels/102",
@@ -27,6 +28,7 @@
             [274, 315]
         ],
         "socket_ip": "192.168.7.100",
-        "socket_port": 9001
+        "socket_port": 9001,
+        "min_box_height": 80
     }
 ]
