@@ -20,6 +20,8 @@ import argparse
 import os
 import time
 import threading
+import socket
+import json
 import cv2
 import numpy as np
 import requests
@@ -28,7 +30,6 @@ from requests.auth import HTTPBasicAuth, HTTPDigestAuth
 from concurrent.futures import ThreadPoolExecutor
 from ultralytics import YOLO
 import openvino
-import os
 
 def add_ov_libs_to_path():
     try:
@@ -95,7 +96,36 @@ tracked_entered_ids = set()
 last_recognized_plate = {}  # {cam_index: plate_text} – biển số cuối cùng theo từng làn
 last_recognized_time  = {}  # {cam_index: time_text}  – thời gian nhận diện theo từng làn
 
-def process_alpr_task(track_id, cam_index, ip, user, password, snapshot_url_template, save_plates=False):
+
+def send_plate_via_socket(plate_text: str, cam_index: int, track_id: int,
+                          socket_ip: str, socket_port: int):
+    """
+    Gửi thông tin biển số vừa nhận diện đến server qua TCP socket dưới dạng JSON.
+    Mỗi camera có socket_ip / socket_port riêng cấu hình trong camera.json.
+    Chỉ gửi khi plate_text hợp lệ (không phải NO_PLATE / rỗng).
+    """
+    if not socket_ip or not socket_port:
+        return
+
+    payload = {
+        "cam":       cam_index + 1,           # Số làn (1-based cho dễ đọc)
+        "plate":     plate_text,
+        "track_id":  track_id,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    msg = json.dumps(payload, ensure_ascii=False) + "\n"
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(3)
+            s.connect((socket_ip, int(socket_port)))
+            s.sendall(msg.encode("utf-8"))
+        print(f"[SOCKET] Cam {cam_index+1} → {socket_ip}:{socket_port} | {msg.strip()}")
+    except Exception as e:
+        print(f"[SOCKET] Lỗi gửi Cam {cam_index+1} → {socket_ip}:{socket_port} | {e}")
+
+def process_alpr_task(track_id, cam_index, ip, user, password, snapshot_url_template,
+                      save_plates=False, socket_ip="", socket_port=0):
     global last_recognized_plate, last_recognized_time
     # Mỗi cam_index có entry riêng → biển số chỉ hiện đúng màn hình của làn đó
     cam_track_key = (cam_index, track_id)
@@ -129,6 +159,9 @@ def process_alpr_task(track_id, cam_index, ip, user, password, snapshot_url_temp
                                 last_recognized_plate[cam_index] = r.ocr.text
                                 last_recognized_time[cam_index]  = time.strftime("%H:%M:%S %d/%m/%Y")
                                 print(f"[ALPR] Biển số: {r.ocr.text} (Cam {cam_index+1} Xe ID {track_id}) lúc {last_recognized_time[cam_index]}")
+                                # Gửi qua socket – chỉ khi có biển số hợp lệ
+                                send_plate_via_socket(r.ocr.text, cam_index, track_id,
+                                                      socket_ip, socket_port)
                                 return
 
                         # Không có bounding box chữ nào
@@ -377,11 +410,15 @@ def draw_boxes(frame, results, conf_threshold: float, save_plates: bool = False,
                         cam_track_key = (cam_index, track_id)
                         if cam_track_key not in tracked_entered_ids:
                             tracked_entered_ids.add(cam_track_key)
-                            ip = cam_info.get("hkv_ip") if cam_info else HKV_IP
-                            user = cam_info.get("hkv_user") if cam_info else HKV_USER
-                            pwd = cam_info.get("hkv_pass") if cam_info else HKV_PASS
-                            snap_url = cam_info.get("hkv_snapshot_url") if cam_info else HKV_SNAPSHOT_URL
-                            alpr_executor.submit(process_alpr_task, track_id, cam_index, ip, user, pwd, snap_url, save_plates)
+                            ip        = cam_info.get("hkv_ip")           if cam_info else HKV_IP
+                            user      = cam_info.get("hkv_user")         if cam_info else HKV_USER
+                            pwd       = cam_info.get("hkv_pass")         if cam_info else HKV_PASS
+                            snap_url  = cam_info.get("hkv_snapshot_url") if cam_info else HKV_SNAPSHOT_URL
+                            sock_ip   = cam_info.get("socket_ip",   "")  if cam_info else ""
+                            sock_port = cam_info.get("socket_port",  0)  if cam_info else 0
+                            alpr_executor.submit(process_alpr_task, track_id, cam_index,
+                                                 ip, user, pwd, snap_url,
+                                                 save_plates, sock_ip, sock_port)
 
             label = VEHICLE_CLASSES[cls_id]
             color = COLOR_MAP[cls_id]
