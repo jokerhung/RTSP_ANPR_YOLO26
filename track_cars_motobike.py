@@ -92,11 +92,12 @@ def get_alpr():
 alpr_executor = ThreadPoolExecutor(max_workers=4)
 track_id_to_plate = {}
 tracked_entered_ids = set()
-last_recognized_plate = ""  # Lưu biển số nhận diện cuối cùng
-last_recognized_time = ""   # Lưu thời gian nhận diện cuối cùng
+last_recognized_plate = {}  # {cam_index: plate_text} – biển số cuối cùng theo từng làn
+last_recognized_time  = {}  # {cam_index: time_text}  – thời gian nhận diện theo từng làn
 
 def process_alpr_task(track_id, cam_index, ip, user, password, snapshot_url_template, save_plates=False):
     global last_recognized_plate, last_recognized_time
+    # Mỗi cam_index có entry riêng → biển số chỉ hiện đúng màn hình của làn đó
     cam_track_key = (cam_index, track_id)
     if not ip:
         print("[ALPR] Chưa cấu hình IP (HKV_IP hoặc từ camera.json)")
@@ -125,19 +126,19 @@ def process_alpr_task(track_id, cam_index, ip, user, password, snapshot_url_temp
                         for r in results:
                             if r.ocr and r.ocr.text:
                                 track_id_to_plate[cam_track_key] = r.ocr.text
-                                last_recognized_plate = r.ocr.text
-                                last_recognized_time = time.strftime("%H:%M:%S %d/%m/%Y")
-                                print(f"[ALPR] Biển số: {r.ocr.text} (Cam {cam_index+1} Xe ID {track_id}) lúc {last_recognized_time}")
+                                last_recognized_plate[cam_index] = r.ocr.text
+                                last_recognized_time[cam_index]  = time.strftime("%H:%M:%S %d/%m/%Y")
+                                print(f"[ALPR] Biển số: {r.ocr.text} (Cam {cam_index+1} Xe ID {track_id}) lúc {last_recognized_time[cam_index]}")
                                 return
 
                         # Không có bounding box chữ nào
-                        last_recognized_plate = "NO_PLATE"
-                        last_recognized_time = time.strftime("%H:%M:%S %d/%m/%Y")
+                        last_recognized_plate[cam_index] = "NO_PLATE"
+                        last_recognized_time[cam_index]  = time.strftime("%H:%M:%S %d/%m/%Y")
                         print(f"[ALPR] Không đọc được chữ trên biển số cho Cam {cam_index+1} Xe ID {track_id}")
                     else:
                         # Hoàn toàn không tìm thấy hình dáng biển số
-                        last_recognized_plate = "NO_PLATE"
-                        last_recognized_time = time.strftime("%H:%M:%S %d/%m/%Y")
+                        last_recognized_plate[cam_index] = "NO_PLATE"
+                        last_recognized_time[cam_index]  = time.strftime("%H:%M:%S %d/%m/%Y")
                         print(f"[ALPR] Không tìm thấy biển số trong ảnh chụp cho Cam {cam_index+1} Xe ID {track_id}")
             else:
                 print(f"[ALPR] Lỗi giải mã ảnh chụp từ camera.")
@@ -401,14 +402,17 @@ def draw_boxes(frame, results, conf_threshold: float, save_plates: bool = False,
             cv2.putText(frame, txt, (x1 + 3, y1 - 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
-    # Bảng đếm góc trên-trái
+    # Bảng đếm góc trên-trái – lấy biển số của đúng làn này (cam_index)
+    cam_plate = last_recognized_plate.get(cam_index, "")
+    cam_time  = last_recognized_time.get(cam_index, "")
+
     overlay = frame.copy()
-    
+
     # Tính toán chiều cao vùng đen dựa trên việc có biển số hay không
     bg_height = 25 * len(count) + 15
-    if last_recognized_plate:
-        bg_height += 60 # Thêm không gian cho biển số và timestamp
-        
+    if cam_plate:
+        bg_height += 60  # Thêm không gian cho biển số và timestamp
+
     cv2.rectangle(overlay, (0, 0), (220, bg_height), (20, 20, 20), -1)
     frame = cv2.addWeighted(overlay, 0.55, frame, 0.45, 0)
 
@@ -418,13 +422,13 @@ def draw_boxes(frame, results, conf_threshold: float, save_plates: bool = False,
         cv2.putText(frame, f"  {name}: {cnt}", (5, y),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2)
         y += 25
-        
-    if last_recognized_plate:
+
+    if cam_plate:
         y += 5
-        cv2.putText(frame, f"  BS: {last_recognized_plate}", (5, y),
+        cv2.putText(frame, f"  BS: {cam_plate}", (5, y),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         y += 25
-        cv2.putText(frame, f"  {last_recognized_time}", (5, y),
+        cv2.putText(frame, f"  {cam_time}", (5, y),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
     return frame
