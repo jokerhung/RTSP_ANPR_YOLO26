@@ -642,12 +642,14 @@ class RTSPReader:
 def run_rtsp(rtsp_urls: list, model_path: str, conf: float, device: str,
              reconnect_delay: float = 3.0, max_fps: float = 15.0,
              skip_frames: int = 1, infer_size: int = 640, save_plates: bool = False,
-             cam_configs: list = None, min_box_height: int = 0):
+             cam_configs: list = None, min_box_height: int = 0,
+             no_display: bool = False):
     """
     Nhận dạng realtime từ nhiều camera RTSP (tối đa 4 stream song song).
     skip_frames    : chỉ inference 1 trong mỗi skip_frames frame (giảm CPU)
     infer_size     : resize frame xuống trước inference (mặc định 640)
     min_box_height : bỏ qua xe có bounding box nhỏ hơn N pixel (0 = không lọc)
+    no_display     : True = chạy headless, không mở cửa sổ OpenCV
     """
     import numpy as np
     if len(rtsp_urls) > 4:
@@ -666,7 +668,10 @@ def run_rtsp(rtsp_urls: list, model_path: str, conf: float, device: str,
     print(f"[INFO] Max FPS: {max_fps} | Skip: 1/{skip_frames} frames | Size: {infer_size}")
     for i, u in enumerate(rtsp_urls):
         print(f"[INFO] Cam {i+1} RTSP URL: {u}")
-    print("[INFO] Phím: 'q' thoát | 's' chụp màn hình")
+    if no_display:
+        print("[INFO] Chế độ HEADLESS — không hiển thị cửa sổ video. Nhấn Ctrl+C để dừng.")
+    else:
+        print("[INFO] Phím: 'q' thoát | 's' chụp màn hình")
 
     readers = [RTSPReader(url, reconnect_delay=reconnect_delay, read_fps=max_fps).start() for url in rtsp_urls]
 
@@ -679,9 +684,11 @@ def run_rtsp(rtsp_urls: list, model_path: str, conf: float, device: str,
     last_results_list = [sv.Detections.empty() for _ in range(num_cams)]
     grid_w, grid_h = 960, 540
 
-    setup_done = False if args.setup_region else True
+    # --no-display bỏ qua --setup-region (không có cửa sổ để click)
+    setup_done = False if (args.setup_region and not no_display) else True
 
-    while True:
+    try:
+      while True:
         frames = []
         rets = []
         for reader in readers:
@@ -696,21 +703,24 @@ def run_rtsp(rtsp_urls: list, model_path: str, conf: float, device: str,
                 frames.append(blank)
 
         if not any(rets):
-            grid_frames = [f if f.shape[:2] == (grid_h, grid_w) else cv2.resize(f, (grid_w, grid_h)) for f in frames]
-            while len(grid_frames) < 4:
-                grid_frames.append(np.zeros((grid_h, grid_w, 3), dtype='uint8'))
-                
-            if num_cams == 1:
-                final_display = frames[0]
+            if no_display:
+                time.sleep(0.2)
             else:
-                top_row = np.hstack((grid_frames[0], grid_frames[1]))
-                bottom_row = np.hstack((grid_frames[2], grid_frames[3]))
-                final_display = np.vstack((top_row, bottom_row))
-                
-            cv2.namedWindow("YOLO26 Multi-RTSP | OpenVINO", cv2.WINDOW_NORMAL)
-            cv2.imshow("YOLO26 Multi-RTSP | OpenVINO", final_display)
-            if cv2.waitKey(200) & 0xFF == ord("q"):
-                break
+                grid_frames = [f if f.shape[:2] == (grid_h, grid_w) else cv2.resize(f, (grid_w, grid_h)) for f in frames]
+                while len(grid_frames) < 4:
+                    grid_frames.append(np.zeros((grid_h, grid_w, 3), dtype='uint8'))
+
+                if num_cams == 1:
+                    final_display = frames[0]
+                else:
+                    top_row    = np.hstack((grid_frames[0], grid_frames[1]))
+                    bottom_row = np.hstack((grid_frames[2], grid_frames[3]))
+                    final_display = np.vstack((top_row, bottom_row))
+
+                cv2.namedWindow("YOLO26 Multi-RTSP | OpenVINO", cv2.WINDOW_NORMAL)
+                cv2.imshow("YOLO26 Multi-RTSP | OpenVINO", final_display)
+                if cv2.waitKey(200) & 0xFF == ord("q"):
+                    break
             continue
 
         if not setup_done and sum(rets) >= 1:
@@ -757,6 +767,8 @@ def run_rtsp(rtsp_urls: list, model_path: str, conf: float, device: str,
                     last_results_list[i] = sv_det
 
         # ---------- Draw boxes & Overlay ----------
+        # draw_boxes luôn được gọi để ALPR polygon trigger hoạt động đúng.
+        # Khi headless, bỏ qua toàn bộ rendering lên màn hình.
         displays = []
         for i in range(num_cams):
             if rets[i]:
@@ -765,43 +777,49 @@ def run_rtsp(rtsp_urls: list, model_path: str, conf: float, device: str,
                                   cam_index=i, min_box_height=min_box_height)
             else:
                 disp = frames[i].copy()
-                
-            h, w = disp.shape[:2]
-            cv2.rectangle(disp, (0, 0), (min(w, 350), 38), (20, 20, 20), -1)
-            cv2.putText(disp, f"Cam {i+1} | YOLO26", (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 200), 2)
-            
-            conn_txt   = "CONNECTED" if readers[i].connected else "RECONNECTING..."
-            conn_color = (0, 200, 80) if readers[i].connected else (0, 80, 255)
-            cv2.putText(disp, conn_txt, (10, h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.6, conn_color, 2)
+
+            if not no_display:
+                h, w = disp.shape[:2]
+                cv2.rectangle(disp, (0, 0), (min(w, 350), 38), (20, 20, 20), -1)
+                cv2.putText(disp, f"Cam {i+1} | YOLO26", (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 200), 2)
+                conn_txt   = "CONNECTED" if readers[i].connected else "RECONNECTING..."
+                conn_color = (0, 200, 80) if readers[i].connected else (0, 80, 255)
+                cv2.putText(disp, conn_txt, (10, h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.6, conn_color, 2)
             displays.append(disp)
 
-        # ---------- Grid Display ----------
-        if num_cams == 1:
-            final_display = displays[0]
-        else:
-            grid_frames = [cv2.resize(d, (grid_w, grid_h)) for d in displays]
-            while len(grid_frames) < 4:
-                grid_frames.append(np.zeros((grid_h, grid_w, 3), dtype='uint8'))
-                
-            top_row = np.hstack((grid_frames[0], grid_frames[1]))
-            bottom_row = np.hstack((grid_frames[2], grid_frames[3]))
-            final_display = np.vstack((top_row, bottom_row))
-
-        # ---------- FPS ----------
+        # ---------- FPS counter (dùng chung cả 2 chế độ) ----------
         fps_count += 1
         elapsed_total = time.perf_counter() - fps_timer
         if elapsed_total >= 1.0:
             fps_display = fps_count / elapsed_total
             fps_count   = 0
             fps_timer   = time.perf_counter()
-
-        fh, fw = final_display.shape[:2]
-        cv2.putText(final_display, f"Total FPS: {fps_display:.1f}", (fw - 180, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 215, 255), 2)
+            if no_display:
+                print(f"[INFO] FPS: {fps_display:.1f}", flush=True)
 
         # ---------- Throttle ----------
         elapsed_frame = time.perf_counter() - t_frame_start
         if elapsed_frame < frame_interval:
             time.sleep(frame_interval - elapsed_frame)
+
+        if no_display:
+            # Headless: không cần imshow — Ctrl+C sẽ dừng (xử lý ở ngoài vòng lặp)
+            continue
+
+        # ---------- Grid Display (chỉ khi có cửa sổ) ----------
+        if num_cams == 1:
+            final_display = displays[0]
+        else:
+            grid_frames = [cv2.resize(d, (grid_w, grid_h)) for d in displays]
+            while len(grid_frames) < 4:
+                grid_frames.append(np.zeros((grid_h, grid_w, 3), dtype='uint8'))
+            top_row    = np.hstack((grid_frames[0], grid_frames[1]))
+            bottom_row = np.hstack((grid_frames[2], grid_frames[3]))
+            final_display = np.vstack((top_row, bottom_row))
+
+        fh, fw = final_display.shape[:2]
+        cv2.putText(final_display, f"Total FPS: {fps_display:.1f}",
+                    (fw - 180, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 215, 255), 2)
 
         cv2.namedWindow("YOLO26 Multi-RTSP | OpenVINO", cv2.WINDOW_NORMAL)
         cv2.imshow("YOLO26 Multi-RTSP | OpenVINO", final_display)
@@ -814,10 +832,14 @@ def run_rtsp(rtsp_urls: list, model_path: str, conf: float, device: str,
             print(f"[INFO] Đã lưu: {name}")
             shot_idx += 1
 
-    for reader in readers:
-        reader.stop()
-    cv2.destroyAllWindows()
-    print("[INFO] Đã dừng RTSP detection.")
+    except KeyboardInterrupt:
+        print("\n[INFO] Nhận Ctrl+C — đang dừng...")
+    finally:
+        for reader in readers:
+            reader.stop()
+        if not no_display:
+            cv2.destroyAllWindows()
+        print("[INFO] Đã dừng RTSP detection.")
 
 
 # ---------------------------------------------------------------------------
@@ -961,6 +983,10 @@ if __name__ == "__main__":
     parser.add_argument("--min-box-height", type=int, default=0,
                         help="Bỏ qua xe có bounding box cao < N pixel – lọc xe xa (mặc định: 0 = không lọc). "
                              "Có thể cấu hình riêng từng làn qua 'min_box_height' trong camera.json")
+    parser.add_argument("--no-display", action="store_true",
+                        help="Chạy headless – không mở cửa sổ OpenCV. "
+                             "Dùng khi chạy trên server/dịch vụ không có màn hình. "
+                             "Dừng bằng Ctrl+C. (--setup-region bị bỏ qua khi bật cờ này)")
     parser.add_argument("--setup-region", action="store_true",
                         help="Hiện UI tương tác để click 4 điểm vẽ vùng nhận diện, lưu vào .env")
     parser.add_argument("--save-plates", action="store_true",
@@ -1044,6 +1070,7 @@ if __name__ == "__main__":
             save_plates     = args.save_plates,
             cam_configs     = cam_configs_json,
             min_box_height  = args.min_box_height,
+            no_display      = args.no_display,
         )
     elif args.api:
         run_api(
