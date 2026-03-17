@@ -29,6 +29,7 @@ import ssl
 from requests.auth import HTTPBasicAuth, HTTPDigestAuth
 from concurrent.futures import ThreadPoolExecutor
 from ultralytics import YOLO
+import supervision as sv
 import openvino
 
 def add_ov_libs_to_path():
@@ -348,9 +349,13 @@ def predict_image(model: YOLO, image_path: str, conf: float, device: str) -> lis
     return detections
 
 
-def draw_boxes(frame, results, conf_threshold: float, save_plates: bool = False,
-               cam_info: dict = None, cam_index: int = 0, min_box_height: int = 0):
-    """Vẽ bounding box + nhãn + bộ đếm lên frame."""
+def draw_boxes(frame, sv_detections: sv.Detections, conf_threshold: float,
+               save_plates: bool = False, cam_info: dict = None,
+               cam_index: int = 0, min_box_height: int = 0):
+    """
+    Vẽ bounding box + nhãn + bộ đếm lên frame.
+    sv_detections : sv.Detections đã được Supervision ByteTrack cập nhật tracker_id.
+    """
     count = {name: 0 for name in VEHICLE_CLASSES.values()}
 
     # min_box_height ưu tiên từ camera config, fallback xuống tham số truyền vào
@@ -366,86 +371,82 @@ def draw_boxes(frame, results, conf_threshold: float, save_plates: bool = False,
     if poly_pts is not None:
         cv2.polylines(frame, [poly_pts], isClosed=True, color=(255, 0, 255), thickness=2)
 
-    for result in results:
-        for box in result.boxes:
-            cls_id = int(box.cls[0])
-            conf   = float(box.conf[0])
-            if cls_id not in VEHICLE_CLASSES or conf < conf_threshold:
-                continue
+    for j in range(len(sv_detections)):
+        cls_id   = int(sv_detections.class_id[j])
+        conf     = float(sv_detections.confidence[j])
+        track_id = int(sv_detections.tracker_id[j]) if sv_detections.tracker_id is not None else None
 
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
+        if cls_id not in VEHICLE_CLASSES or conf < conf_threshold:
+            continue
 
-            # Lọc xe xa: bỏ qua box có chiều cao nhỏ hơn ngưỡng tối thiểu
-            if _min_h > 0 and (y2 - y1) < _min_h:
-                continue
+        x1, y1, x2, y2 = map(int, sv_detections.xyxy[j])
 
-            # Kiểm tra polygon chỉ để trigger ALPR — không dùng để ẩn bounding box
-            if poly_pts is not None:
-                cx = (x1 + x2) // 2
-                cy = (y1 + y2) // 2
+        # Lọc xe xa: bỏ qua box có chiều cao nhỏ hơn ngưỡng tối thiểu
+        if _min_h > 0 and (y2 - y1) < _min_h:
+            continue
 
-                # Kiểm tra xem bounding box có giao cắt/chạm vào vùng polygon không
-                pts_to_check = [
-                    (float(cx), float(y2)),  # Giữa cạnh dưới
-                    (float(cx), float(cy)),  # Tâm điểm
-                    (float(x1), float(y2)),  # Góc dưới trái
-                    (float(x2), float(y2)),  # Góc dưới phải
-                    (float(x1), float(y1)),  # Góc trên trái
-                    (float(x2), float(y1)),  # Góc trên phải
-                    (float(x1), float(cy)),  # Giữa cạnh trái
-                    (float(x2), float(cy)),  # Giữa cạnh phải
-                ]
+        # Kiểm tra polygon chỉ để trigger ALPR — không dùng để ẩn bounding box
+        if poly_pts is not None:
+            cx = (x1 + x2) // 2
+            cy = (y1 + y2) // 2
 
-                is_inside = False
-                for pt in pts_to_check:
-                    if cv2.pointPolygonTest(poly_pts, pt, False) >= 0:
+            # Kiểm tra xem bounding box có giao cắt/chạm vào vùng polygon không
+            pts_to_check = [
+                (float(cx), float(y2)),  # Giữa cạnh dưới
+                (float(cx), float(cy)),  # Tâm điểm
+                (float(x1), float(y2)),  # Góc dưới trái
+                (float(x2), float(y2)),  # Góc dưới phải
+                (float(x1), float(y1)),  # Góc trên trái
+                (float(x2), float(y1)),  # Góc trên phải
+                (float(x1), float(cy)),  # Giữa cạnh trái
+                (float(x2), float(cy)),  # Giữa cạnh phải
+            ]
+
+            is_inside = False
+            for pt in pts_to_check:
+                if cv2.pointPolygonTest(poly_pts, pt, False) >= 0:
+                    is_inside = True
+                    break
+
+            # Cẩn thận thêm: Nếu polygon nằm lọt thỏm giữa bounding box
+            if not is_inside:
+                for pt in poly_pts:
+                    px, py = pt[0]
+                    if x1 <= px <= x2 and y1 <= py <= y2:
                         is_inside = True
                         break
 
-                # Cẩn thận thêm: Nếu polygon nằm lọt thỏm giữa bounding box
-                if not is_inside:
-                    for pt in poly_pts:
-                        px, py = pt[0]
-                        if x1 <= px <= x2 and y1 <= py <= y2:
-                            is_inside = True
-                            break
-
-                # Chỉ trigger ALPR khi xe trong vùng, không skip vẽ box
-                if is_inside:
-                    track_id = int(box.id[0]) if box.id is not None else None
-                    if track_id is not None:
-                        # Bug fix: dùng (cam_index, track_id) để tránh collision giữa các camera
-                        cam_track_key = (cam_index, track_id)
-                        if cam_track_key not in tracked_entered_ids:
-                            tracked_entered_ids.add(cam_track_key)
-                            ip        = cam_info.get("hkv_ip")           if cam_info else HKV_IP
-                            user      = cam_info.get("hkv_user")         if cam_info else HKV_USER
-                            pwd       = cam_info.get("hkv_pass")         if cam_info else HKV_PASS
-                            snap_url  = cam_info.get("hkv_snapshot_url") if cam_info else HKV_SNAPSHOT_URL
-                            sock_ip   = cam_info.get("socket_ip",   "")  if cam_info else ""
-                            sock_port = cam_info.get("socket_port",  0)  if cam_info else 0
-                            alpr_executor.submit(process_alpr_task, track_id, cam_index,
-                                                 ip, user, pwd, snap_url,
-                                                 save_plates, sock_ip, sock_port)
-
-            label = VEHICLE_CLASSES[cls_id]
-            color = COLOR_MAP[cls_id]
-            count[label] += 1
-
-            track_id = int(box.id[0]) if box.id is not None else None
-
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-
-            txt = f"{label} {conf:.2f}"
-            if track_id is not None:
-                txt = f"ID:{track_id} {txt}"
+            # Chỉ trigger ALPR khi xe trong vùng và đã có tracker_id
+            if is_inside and track_id is not None:
                 cam_track_key = (cam_index, track_id)
-                if cam_track_key in track_id_to_plate:
-                    txt += f" [{track_id_to_plate[cam_track_key]}]"
-            (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-            cv2.rectangle(frame, (x1, y1 - th - 10), (x1 + tw + 6, y1), color, -1)
-            cv2.putText(frame, txt, (x1 + 3, y1 - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                if cam_track_key not in tracked_entered_ids:
+                    tracked_entered_ids.add(cam_track_key)
+                    ip        = cam_info.get("hkv_ip")           if cam_info else HKV_IP
+                    user      = cam_info.get("hkv_user")         if cam_info else HKV_USER
+                    pwd       = cam_info.get("hkv_pass")         if cam_info else HKV_PASS
+                    snap_url  = cam_info.get("hkv_snapshot_url") if cam_info else HKV_SNAPSHOT_URL
+                    sock_ip   = cam_info.get("socket_ip",  "")   if cam_info else ""
+                    sock_port = cam_info.get("socket_port",  0)  if cam_info else 0
+                    alpr_executor.submit(process_alpr_task, track_id, cam_index,
+                                         ip, user, pwd, snap_url,
+                                         save_plates, sock_ip, sock_port)
+
+        label = VEHICLE_CLASSES[cls_id]
+        color = COLOR_MAP[cls_id]
+        count[label] += 1
+
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+        txt = f"{label} {conf:.2f}"
+        if track_id is not None:
+            txt = f"ID:{track_id} {txt}"
+            cam_track_key = (cam_index, track_id)
+            if cam_track_key in track_id_to_plate:
+                txt += f" [{track_id_to_plate[cam_track_key]}]"
+        (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        cv2.rectangle(frame, (x1, y1 - th - 10), (x1 + tw + 6, y1), color, -1)
+        cv2.putText(frame, txt, (x1 + 3, y1 - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
     # Bảng đếm góc trên-trái – lấy biển số của đúng làn này (cam_index)
     cam_plate = last_recognized_plate.get(cam_index, "")
@@ -655,10 +656,13 @@ def run_rtsp(rtsp_urls: list, model_path: str, conf: float, device: str,
 
     num_cams = len(rtsp_urls)
     print(f"[INFO] Nạp model: {model_path} cho {num_cams} camera")
-    models = [load_model(model_path) for _ in range(num_cams)]
-    device = get_device(model_path, device)
+    models  = [load_model(model_path) for _ in range(num_cams)]
+    # Mỗi camera có một ByteTrack tracker riêng → track_id độc lập giữa các làn
+    trackers = [sv.ByteTrack() for _ in range(num_cams)]
+    device  = get_device(model_path, device)
     backend = "OpenVINO" if os.path.isdir(model_path) else f"PyTorch ({device})"
     print(f"[INFO] Backend: {backend} | Device: {device} | Conf ≥ {conf}")
+    print(f"[INFO] Tracker: Supervision ByteTrack (mỗi camera 1 tracker độc lập)")
     print(f"[INFO] Max FPS: {max_fps} | Skip: 1/{skip_frames} frames | Size: {infer_size}")
     for i, u in enumerate(rtsp_urls):
         print(f"[INFO] Cam {i+1} RTSP URL: {u}")
@@ -672,7 +676,7 @@ def run_rtsp(rtsp_urls: list, model_path: str, conf: float, device: str,
     fps_display     = 0.0
     shot_idx        = 0
     frame_counter   = 0
-    last_results_list = [[] for _ in range(num_cams)]
+    last_results_list = [sv.Detections.empty() for _ in range(num_cams)]
     grid_w, grid_h = 960, 540
 
     setup_done = False if args.setup_region else True
@@ -740,11 +744,17 @@ def run_rtsp(rtsp_urls: list, model_path: str, conf: float, device: str,
         if frame_counter % skip_frames == 0:
             for i in range(num_cams):
                 if rets[i]:
-                    last_results_list[i] = models[i].track(
-                        source=frames[i], imgsz=infer_size, classes=list(VEHICLE_CLASSES.keys()),
+                    # 1. YOLO detect (không dùng .track() — Supervision đảm nhiệm tracking)
+                    yolo_results = models[i].predict(
+                        source=frames[i], imgsz=infer_size,
+                        classes=list(VEHICLE_CLASSES.keys()),
                         conf=conf, device=device, verbose=False,
-                        persist=True, tracker="bytetrack.yaml"
                     )
+                    # 2. Chuyển YOLO result → sv.Detections
+                    sv_det = sv.Detections.from_ultralytics(yolo_results[0])
+                    # 3. Supervision ByteTrack cập nhật tracker_id
+                    sv_det = trackers[i].update_with_detections(sv_det)
+                    last_results_list[i] = sv_det
 
         # ---------- Draw boxes & Overlay ----------
         displays = []

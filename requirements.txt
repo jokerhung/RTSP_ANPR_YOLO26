@@ -10,3 +10,4 @@ openvino==2025.4.1
 onnxruntime-openvino==1.23.0
 lap==0.5.13
 ultralytics==8.4.0
+supervision==0.27.0.post2
