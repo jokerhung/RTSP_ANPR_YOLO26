@@ -679,6 +679,7 @@ def run_rtsp(rtsp_urls: list, model_path: str, conf: float, device: str,
     fps_timer       = time.perf_counter()
     fps_count       = 0
     fps_display     = 0.0
+    last_fps_print  = time.perf_counter()
     shot_idx        = 0
     frame_counter   = 0
     last_results_list = [sv.Detections.empty() for _ in range(num_cams)]
@@ -794,8 +795,9 @@ def run_rtsp(rtsp_urls: list, model_path: str, conf: float, device: str,
             fps_display = fps_count / elapsed_total
             fps_count   = 0
             fps_timer   = time.perf_counter()
-            if no_display:
+            if no_display and time.perf_counter() - last_fps_print >= 60.0:
                 print(f"[INFO] FPS: {fps_display:.1f}", flush=True)
+                last_fps_print = time.perf_counter()
 
         # ---------- Throttle ----------
         elapsed_frame = time.perf_counter() - t_frame_start
