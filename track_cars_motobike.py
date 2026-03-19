@@ -53,13 +53,43 @@ def add_ov_libs_to_path():
 
 add_ov_libs_to_path()
 
-# Bỏ qua lỗi SSL Certificate khi fast-alpr (hoặc open-image-models) tải weights từ GitHub/HuggingFace
+# ── Bypass SSL toàn diện (fast-alpr / open-image-models / huggingface_hub) ──────
+# Patch 1: urllib.request.urlopen không truyền context
 try:
-    _create_unverified_https_context = ssl._create_unverified_context
+    ssl._create_default_https_context = ssl._create_unverified_context
 except AttributeError:
     pass
-else:
-    ssl._create_default_https_context = _create_unverified_https_context
+
+# Patch 2: ssl.create_default_context() – tạo context tường minh rồi tắt verify
+_ssl_cdc_orig = ssl.create_default_context
+def _ssl_no_verify_context(*args, **kwargs):
+    ctx = ssl._create_unverified_context()  # bỏ qua CA hoàn toàn
+    return ctx
+ssl.create_default_context = _ssl_no_verify_context
+
+# Patch 3: urllib.request.urlopen – ép context=unverified dù thư viện truyền context riêng
+import urllib.request as _urllib_req
+_urlopen_orig = _urllib_req.urlopen
+def _urlopen_no_verify(url, data=None, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, **kwargs):
+    kwargs["context"] = ssl._create_unverified_context()
+    return _urlopen_orig(url, data=data, timeout=timeout, **kwargs)
+_urllib_req.urlopen = _urlopen_no_verify
+
+# Patch 4: requests.Session – force verify=False (không dùng setdefault)
+os.environ["CURL_CA_BUNDLE"] = ""
+os.environ["REQUESTS_CA_BUNDLE"] = ""
+try:
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    import requests
+    _req_session_orig = requests.Session.request
+    def _req_session_no_verify(self, method, url, **kwargs):
+        kwargs["verify"] = False          # force, không dùng setdefault
+        return _req_session_orig(self, method, url, **kwargs)
+    requests.Session.request = _req_session_no_verify
+except Exception:
+    pass
+# ────────────────────────────────────────────────────────────────────────────────
 
 try:
     from dotenv import load_dotenv
