@@ -74,6 +74,9 @@ HKV_SNAPSHOT_URL = os.getenv("HKV_SNAPSHOT_URL", "http://{ip}/cgi-bin/snapshot.c
 
 ALPR_DETECTOR_MODEL = os.getenv("ALPR_DETECTOR_MODEL", "yolo-v9-t-384-license-plate-end2end")
 ALPR_OCR_MODEL = os.getenv("ALPR_OCR_MODEL", "cct-xs-v1-global-model")
+PLATE_DETECTOR_ONNX = os.getenv("PLATE_DETECTOR_ONNX", "license-plate-finetune-v1x.onnx")
+PLATE_OCR_MODEL = os.getenv("PLATE_OCR_MODEL", "cct-xs-v1-global-model")
+PLATE_DETECTOR_CONF = float(os.getenv("PLATE_DETECTOR_CONF", "0.25"))
 
 alpr_instance = None
 def get_alpr():
@@ -90,6 +93,83 @@ def get_alpr():
             print(f"[ALPR] Không thể tải model: {e}")
             alpr_instance = False
     return alpr_instance
+
+plate_detector_instance = None
+def get_plate_detector():
+    global plate_detector_instance
+    if plate_detector_instance is None:
+        try:
+            import onnxruntime as ort
+            sess = ort.InferenceSession(
+                PLATE_DETECTOR_ONNX,
+                providers=["CPUExecutionProvider"]
+            )
+            plate_detector_instance = sess
+            print(f"[ALPR] Đã tải plate detector ONNX (onnxruntime): {PLATE_DETECTOR_ONNX}")
+        except Exception as e:
+            print(f"[ALPR] Không thể tải plate detector ONNX: {e}")
+            plate_detector_instance = False
+    return plate_detector_instance
+
+
+def _run_plate_detector(sess, img_bgr, input_size=640, conf_thres=0.25, iou_thres=0.45):
+    """Chạy ONNX plate detector, trả về list [x1,y1,x2,y2] theo pixel ảnh gốc.
+    Model yêu cầu stretch resize về input_size x input_size (không letterbox).
+    """
+    h0, w0 = img_bgr.shape[:2]
+    resized = cv2.resize(img_bgr, (input_size, input_size))
+    blob = resized[:, :, ::-1].astype(np.float32) / 255.0         # BGR→RGB, [0,1]
+    blob = np.transpose(blob, (2, 0, 1))[np.newaxis]               # NCHW
+
+    input_name = sess.get_inputs()[0].name
+    raw = sess.run(None, {input_name: blob})[0]                    # [1, 5, anchors]
+    preds = raw[0].T                                               # [anchors, 5]
+    # columns: cx, cy, w, h, conf
+    mask = preds[:, 4] >= conf_thres
+    preds = preds[mask]
+    if len(preds) == 0:
+        return []
+
+    # xywh → xyxy (in input_size space)
+    cx, cy, bw, bh, conf = preds[:, 0], preds[:, 1], preds[:, 2], preds[:, 3], preds[:, 4]
+    x1 = cx - bw / 2
+    y1 = cy - bh / 2
+    x2 = cx + bw / 2
+    y2 = cy + bh / 2
+    boxes_inp = np.stack([x1, y1, x2, y2], axis=1)
+
+    # NMS via cv2.dnn
+    indices = cv2.dnn.NMSBoxes(
+        [[float(b[0]), float(b[1]), float(b[2]-b[0]), float(b[3]-b[1])] for b in boxes_inp],
+        conf.tolist(), conf_thres, iou_thres
+    )
+    if len(indices) == 0:
+        return []
+    indices = indices.flatten()
+
+    # map back to original image coords (stretch scale)
+    sx, sy = w0 / input_size, h0 / input_size
+    results = []
+    for idx in indices:
+        bx1, by1, bx2, by2 = boxes_inp[idx]
+        bx1, by1 = max(0, int(bx1 * sx)), max(0, int(by1 * sy))
+        bx2, by2 = min(w0, int(bx2 * sx)), min(h0, int(by2 * sy))
+        if bx2 > bx1 and by2 > by1:
+            results.append([bx1, by1, bx2, by2])
+    return results
+
+plate_ocr_instance = None
+def get_plate_ocr():
+    global plate_ocr_instance
+    if plate_ocr_instance is None:
+        try:
+            from fast_plate_ocr import LicensePlateRecognizer
+            plate_ocr_instance = LicensePlateRecognizer(hub_ocr_model=PLATE_OCR_MODEL)
+            print(f"[ALPR] Đã tải fast-plate-ocr: {PLATE_OCR_MODEL}")
+        except Exception as e:
+            print(f"[ALPR] Không thể tải fast-plate-ocr: {e}")
+            plate_ocr_instance = False
+    return plate_ocr_instance
 
 alpr_executor = ThreadPoolExecutor(max_workers=4)
 track_id_to_plate = {}
@@ -150,30 +230,51 @@ def process_alpr_task(track_id, cam_index, ip, user, password, snapshot_url_temp
                     cv2.imwrite(filename, img)
                     print(f"[ALPR] Đã chụp và lưu ảnh: {filename}")
 
-                alpr = get_alpr()
-                if alpr:
-                    results = alpr.predict(img)
-                    if results and len(results) > 0:
-                        for r in results:
-                            if r.ocr and r.ocr.text:
-                                track_id_to_plate[cam_track_key] = r.ocr.text
-                                last_recognized_plate[cam_index] = r.ocr.text
-                                last_recognized_time[cam_index]  = time.strftime("%H:%M:%S %d/%m/%Y")
-                                print(f"[ALPR] Biển số: {r.ocr.text} (Cam {cam_index+1} Xe ID {track_id}) lúc {last_recognized_time[cam_index]}")
-                                # Gửi qua socket – chỉ khi có biển số hợp lệ
-                                send_plate_via_socket(r.ocr.text, cam_index, track_id,
-                                                      socket_ip, socket_port)
-                                return
+                plate_text = None
 
-                        # Không có bounding box chữ nào
-                        last_recognized_plate[cam_index] = "NO_PLATE"
-                        last_recognized_time[cam_index]  = time.strftime("%H:%M:%S %d/%m/%Y")
-                        print(f"[ALPR] Không đọc được chữ trên biển số cho Cam {cam_index+1} Xe ID {track_id}")
+                # --- Bước 1: YOLOv11 ONNX phát hiện biển số + fast-plate-ocr ---
+                detector = get_plate_detector()
+                ocr = get_plate_ocr()
+                if detector and ocr:
+                    boxes = _run_plate_detector(detector, img, conf_thres=PLATE_DETECTOR_CONF)
+                    plate_crops = [img[y1:y2, x1:x2] for x1, y1, x2, y2 in boxes]
+                    if plate_crops:
+                        texts = ocr.run(plate_crops)
+                        for text in texts:
+                            if text and text.strip():
+                                plate_text = text.strip().rstrip("_")
+                                break
+                        if plate_text:
+                            print(f"[ALPR] YOLOv11+OCR: {plate_text} (Cam {cam_index+1} Xe ID {track_id})")
+                        else:
+                            print(f"[ALPR] YOLOv11: phát hiện biển số nhưng OCR không đọc được chữ (Cam {cam_index+1})")
                     else:
-                        # Hoàn toàn không tìm thấy hình dáng biển số
-                        last_recognized_plate[cam_index] = "NO_PLATE"
-                        last_recognized_time[cam_index]  = time.strftime("%H:%M:%S %d/%m/%Y")
-                        print(f"[ALPR] Không tìm thấy biển số trong ảnh chụp cho Cam {cam_index+1} Xe ID {track_id}")
+                        print(f"[ALPR] YOLOv11: không phát hiện biển số → thử fast_alpr (Cam {cam_index+1})")
+
+                # --- Bước 2: Fallback fast_alpr nếu YOLOv11 không phát hiện được biển số ---
+                if plate_text is None:
+                    alpr = get_alpr()
+                    if alpr:
+                        alpr_results = alpr.predict(img)
+                        if alpr_results and len(alpr_results) > 0:
+                            for r in alpr_results:
+                                if r.ocr and r.ocr.text:
+                                    plate_text = r.ocr.text
+                                    print(f"[ALPR] fast_alpr fallback: {plate_text} (Cam {cam_index+1} Xe ID {track_id})")
+                                    break
+
+                # --- Kết quả ---
+                ts = time.strftime("%H:%M:%S %d/%m/%Y")
+                if plate_text:
+                    track_id_to_plate[cam_track_key] = plate_text
+                    last_recognized_plate[cam_index] = plate_text
+                    last_recognized_time[cam_index]  = ts
+                    print(f"[ALPR] Biển số: {plate_text} (Cam {cam_index+1} Xe ID {track_id}) lúc {ts}")
+                    send_plate_via_socket(plate_text, cam_index, track_id, socket_ip, socket_port)
+                else:
+                    last_recognized_plate[cam_index] = "NO_PLATE"
+                    last_recognized_time[cam_index]  = ts
+                    print(f"[ALPR] Không nhận diện được biển số cho Cam {cam_index+1} Xe ID {track_id}")
             else:
                 print(f"[ALPR] Lỗi giải mã ảnh chụp từ camera.")
         else:
@@ -1022,32 +1123,65 @@ if __name__ == "__main__":
         if not os.path.exists(img_path):
             print(f"[ERROR] Không tìm thấy file: {img_path}")
             exit(1)
-        
+
         img = cv2.imread(img_path)
         if img is None:
             print(f"[ERROR] Không thể đọc được ảnh (hỏng file): {img_path}")
             exit(1)
-            
-        alpr = get_alpr()
-        if not alpr:
-            print("[ERROR] Init fast_alpr thất bại.")
-            exit(1)
-            
-        alpr_results  = alpr.predict(img)
-        print(alpr_results )
-        if alpr_results  and len(alpr_results ) > 0:
-            for i, r in enumerate(alpr_results ):
-                text = r.ocr.text if r.ocr else "N/A"
-                print(f"  -> Biển số [{i+1}]: {text}")
-                
-            # Vẽ ra kết quả
-            img_drawn = alpr.draw_predictions(img)
+
+        plate_text = None
+        img_drawn  = None
+
+        # --- Bước 1: YOLOv11 ONNX + fast-plate-ocr ---
+        detector = get_plate_detector()
+        ocr      = get_plate_ocr()
+        if detector and ocr:
+            boxes = _run_plate_detector(detector, img)
+            if boxes:
+                img_drawn = img.copy()
+                plate_crops = []
+                for x1, y1, x2, y2 in boxes:
+                    cv2.rectangle(img_drawn, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    plate_crops.append(img[y1:y2, x1:x2])
+                texts = ocr.run(plate_crops)
+                print(f"[YOLOv11+OCR] Phát hiện {len(plate_crops)} biển số:")
+                for i, text in enumerate(texts):
+                    print(f"  -> Biển số [{i+1}]: {text}")
+                    if text and text.strip() and plate_text is None:
+                        plate_text = text.strip().rstrip("_")
+            else:
+                print("[YOLOv11] Không phát hiện biển số → thử fast_alpr")
+        else:
+            print("[YOLOv11] Không load được detector/OCR → thử fast_alpr")
+
+        # --- Bước 2: Fallback fast_alpr nếu YOLOv11 không phát hiện được biển số ---
+        if plate_text is None:
+            alpr = get_alpr()
+            if alpr:
+                alpr_results = alpr.predict(img)
+                print(f"[fast_alpr fallback] Kết quả: {alpr_results}")
+                if alpr_results and len(alpr_results) > 0:
+                    for i, r in enumerate(alpr_results):
+                        text = r.ocr.text if r.ocr else "N/A"
+                        print(f"  -> Biển số [{i+1}]: {text}")
+                        if r.ocr and r.ocr.text and plate_text is None:
+                            plate_text = r.ocr.text
+                    img_drawn = alpr.draw_predictions(img)
+                else:
+                    print("[fast_alpr] Không nhận diện được biển số nào.")
+            else:
+                print("[ERROR] Không load được fast_alpr.")
+
+        if plate_text:
+            print(f"\n[RESULT] Biển số: {plate_text}")
+        else:
+            print("\n[RESULT] Không nhận diện được biển số nào từ ảnh này.")
+
+        if img_drawn is not None:
             cv2.imshow("Test ALPR", img_drawn)
             print("[INFO] Nhấn phím bất kỳ (trên cửa sổ ảnh) để thoát...")
             cv2.waitKey(0)
             cv2.destroyAllWindows()
-        else:
-            print("[FAILED] Không nhận diện được biển số nào từ ảnh này.")
         exit(0)
 
     if args.rtsp:
