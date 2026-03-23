@@ -32,6 +32,14 @@ from ultralytics import YOLO
 import supervision as sv
 import openvino
 
+import builtins as _builtins
+_orig_print = _builtins.print
+def print(*args, **kwargs):
+    import time as _time
+    _orig_print(f"[{_time.strftime('%Y-%m-%d %H:%M:%S')}]", *args, **kwargs)
+_builtins.print = print
+
+
 def add_ov_libs_to_path():
     try:
         # Tùy thuộc vào phiên bản OpenVINO, các tệp DLL có thể nằm ở các vị trí khác nhau
@@ -107,6 +115,7 @@ ALPR_OCR_MODEL = os.getenv("ALPR_OCR_MODEL", "cct-xs-v1-global-model")
 PLATE_DETECTOR_ONNX = os.getenv("PLATE_DETECTOR_ONNX", "license-plate-finetune-v1x.onnx")
 PLATE_OCR_MODEL = os.getenv("PLATE_OCR_MODEL", "cct-xs-v1-global-model")
 PLATE_DETECTOR_CONF = float(os.getenv("PLATE_DETECTOR_CONF", "0.25"))
+SKIP_FRAMES = int(os.getenv("SKIP_FRAMES", "2"))  # 1 = xử lý mọi frame (không bỏ qua)
 
 alpr_instance = None
 def get_alpr():
@@ -552,6 +561,7 @@ def draw_boxes(frame, sv_detections: sv.Detections, conf_threshold: float,
                 cam_track_key = (cam_index, track_id)
                 if cam_track_key not in tracked_entered_ids:
                     tracked_entered_ids.add(cam_track_key)
+                    print(f"[REGION] Xe mới vào vùng — Cam {cam_index+1} | ID:{track_id} | Class:{VEHICLE_CLASSES.get(cls_id, cls_id)} | Conf:{conf:.2f} | Box:({x1},{y1})-({x2},{y2})")
                     ip        = cam_info.get("hkv_ip")           if cam_info else HKV_IP
                     user      = cam_info.get("hkv_user")         if cam_info else HKV_USER
                     pwd       = cam_info.get("hkv_pass")         if cam_info else HKV_PASS
@@ -1109,8 +1119,8 @@ if __name__ == "__main__":
                         help="Ngưỡng confidence (mặc định: 0.45)")
     parser.add_argument("--device", type=str,  default="GPU",
                         help="Device: 'cpu' | 'GPU' | 'AUTO' (với OpenVINO IR model, mặc định: GPU)")
-    parser.add_argument("--skip-frames", type=int, default=2,
-                        help="Inference 1/N frame để giảm CPU (mặc định: 2 = bỏ qua 1 frame)")
+    parser.add_argument("--skip-frames", type=int, default=SKIP_FRAMES,
+                        help=f"Inference 1/N frame để giảm CPU (mặc định: {SKIP_FRAMES}, lấy từ env SKIP_FRAMES). Đặt 1 để xử lý mọi frame")
     parser.add_argument("--infer-size", type=int, default=640,
                         help="Resize ảnh trước inference (mặc định: 640, giảm xuống 320 để giảm CPU)")
     parser.add_argument("--min-box-height", type=int, default=0,
