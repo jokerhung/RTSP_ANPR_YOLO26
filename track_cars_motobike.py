@@ -109,6 +109,7 @@ HKV_IP = os.getenv("HKV_IP", "")
 HKV_USER = os.getenv("HKV_USER", "admin")
 HKV_PASS = os.getenv("HKV_PASS", "")
 HKV_SNAPSHOT_URL = os.getenv("HKV_SNAPSHOT_URL", "http://{ip}/cgi-bin/snapshot.cgi?channel=1&subtype=0")
+ENABLE_ALPR = os.getenv("ENABLE_ALPR", "true").strip().lower() not in ("0", "false", "no")
 
 ALPR_DETECTOR_MODEL = os.getenv("ALPR_DETECTOR_MODEL", "yolo-v9-t-384-license-plate-end2end")
 ALPR_OCR_MODEL = os.getenv("ALPR_OCR_MODEL", "cct-xs-v1-global-model")
@@ -243,6 +244,39 @@ def send_plate_via_socket(plate_text: str, cam_index: int, track_id: int,
         print(f"[SOCKET] Cam {cam_index+1} → {socket_ip}:{socket_port} | {msg.strip()}")
     except Exception as e:
         print(f"[SOCKET] Lỗi gửi Cam {cam_index+1} → {socket_ip}:{socket_port} | {e}")
+
+
+def send_vehicle_enter_via_socket(cam_index: int, track_id: int, class_name: str,
+                                   conf: float, bbox: tuple,
+                                   socket_ip: str, socket_port: int):
+    """
+    Gửi sự kiện xe mới vào vùng đến server qua TCP socket dưới dạng JSON.
+    Được gọi ngay khi phát hiện xe đi vào region polygon.
+    """
+    if not socket_ip or not socket_port:
+        return
+
+    x1, y1, x2, y2 = bbox
+    payload = {
+        "event":      "vehicle_enter",
+        "cam":        cam_index + 1,
+        "track_id":   track_id,
+        "class":      class_name,
+        "confidence": round(conf, 4),
+        "bbox":       {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
+        "timestamp":  time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    msg = json.dumps(payload, ensure_ascii=False) + "\n"
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(3)
+            s.connect((socket_ip, int(socket_port)))
+            s.sendall(msg.encode("utf-8"))
+        print(f"[SOCKET] vehicle_enter Cam {cam_index+1} → {socket_ip}:{socket_port} | {msg.strip()}")
+    except Exception as e:
+        print(f"[SOCKET] Lỗi gửi vehicle_enter Cam {cam_index+1} → {socket_ip}:{socket_port} | {e}")
+
 
 def process_alpr_task(track_id, cam_index, ip, user, password, snapshot_url_template,
                       save_plates=False, socket_ip="", socket_port=0):
@@ -568,9 +602,16 @@ def draw_boxes(frame, sv_detections: sv.Detections, conf_threshold: float,
                     snap_url  = cam_info.get("hkv_snapshot_url") if cam_info else HKV_SNAPSHOT_URL
                     sock_ip   = cam_info.get("socket_ip",  "")   if cam_info else ""
                     sock_port = cam_info.get("socket_port",  0)  if cam_info else 0
-                    alpr_executor.submit(process_alpr_task, track_id, cam_index,
-                                         ip, user, pwd, snap_url,
-                                         save_plates, sock_ip, sock_port)
+                    send_vehicle_enter_via_socket(
+                        cam_index, track_id, VEHICLE_CLASSES.get(cls_id, str(cls_id)),
+                        conf, (x1, y1, x2, y2), sock_ip, sock_port
+                    )
+                    if ENABLE_ALPR:
+                        alpr_executor.submit(process_alpr_task, track_id, cam_index,
+                                             ip, user, pwd, snap_url,
+                                             save_plates, sock_ip, sock_port)
+                    else:
+                        print(f"[ALPR] Bỏ qua nhận dạng biển số (ENABLE_ALPR=false) — Cam {cam_index+1} ID:{track_id}")
 
         label = VEHICLE_CLASSES[cls_id]
         color = COLOR_MAP[cls_id]
