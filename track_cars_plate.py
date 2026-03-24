@@ -113,11 +113,12 @@ ENABLE_ALPR = os.getenv("ENABLE_ALPR", "true").strip().lower() not in ("0", "fal
 
 ALPR_DETECTOR_MODEL = os.getenv("ALPR_DETECTOR_MODEL", "yolo-v9-t-384-license-plate-end2end")
 ALPR_OCR_MODEL = os.getenv("ALPR_OCR_MODEL", "cct-xs-v1-global-model")
-PLATE_DETECTOR_ONNX = os.getenv("PLATE_DETECTOR_ONNX", "license-plate-finetune-v1n.onnx")
+PLATE_DETECTOR_ONNX = os.getenv("PLATE_DETECTOR_ONNX", "license-plate-finetune-v1n_openvino_model")
 PLATE_OCR_MODEL = os.getenv("PLATE_OCR_MODEL", "cct-xs-v1-global-model")
 PLATE_DETECTOR_CONF = float(os.getenv("PLATE_DETECTOR_CONF", "0.25"))
 SKIP_FRAMES = int(os.getenv("SKIP_FRAMES", "2"))  # 1 = xử lý mọi frame (không bỏ qua)
 OV_DEVICE   = os.getenv("OV_DEVICE", "CPU")       # OpenVINO device: CPU | GPU | AUTO | NPU
+REGION_DWELL_SECONDS = float(os.getenv("REGION_DWELL_SECONDS", "0"))  # 0 = trigger ngay; >0 = phải đứng trong vùng đủ N giây
 
 
 def _ov_device(requested: str) -> str:
@@ -128,21 +129,32 @@ def _ov_device(requested: str) -> str:
 
 class OVDetector:
     """
-    Chạy ONNX detector (YOLOv8/v11 output format) qua OpenVINO runtime.
+    Chạy ONNX / OpenVINO IR detector (YOLOv8/v11 output format) qua OpenVINO runtime.
+    model_path có thể là:
+      - file .onnx
+      - thư mục OpenVINO IR (chứa .xml + .bin) — ưu tiên tốc độ load và inference
     - detect()       → sv.Detections  (dùng cho RTSP stream + ByteTrack)
     - detect_boxes() → list [[x1,y1,x2,y2]]  (dùng cho ALPR crop)
     """
 
-    def __init__(self, onnx_path: str, ov_device: str = "CPU",
+    def __init__(self, model_path: str, ov_device: str = "CPU",
                  input_size: int = 640, conf_thres: float = 0.25, iou_thres: float = 0.45):
+        # Nếu là thư mục OpenVINO IR, tìm file .xml bên trong
+        if os.path.isdir(model_path):
+            xml_files = [f for f in os.listdir(model_path) if f.endswith(".xml")]
+            if not xml_files:
+                raise FileNotFoundError(f"[OV] Không tìm thấy file .xml trong {model_path}")
+            model_path = os.path.join(model_path, xml_files[0])
+            print(f"[OV] Dùng OpenVINO IR: {model_path}")
+
         core  = openvino.Core()
-        model = core.read_model(onnx_path)
+        model = core.read_model(model_path)
         self._compiled  = core.compile_model(model, ov_device)
         self._infer_req = self._compiled.create_infer_request()
         self.input_size = input_size
         self.conf_thres = conf_thres
         self.iou_thres  = iou_thres
-        print(f"[OV] Đã tải {onnx_path} trên {ov_device}")
+        print(f"[OV] Đã tải {model_path} trên {ov_device}")
 
     def _infer(self, img_bgr):
         h0, w0 = img_bgr.shape[:2]
@@ -254,6 +266,7 @@ def get_plate_ocr():
 alpr_executor = ThreadPoolExecutor(max_workers=4)
 track_id_to_plate = {}
 tracked_entered_ids = set()
+track_id_first_in_region = {}  # {(cam_index, track_id): timestamp} – lần đầu phát hiện trong vùng
 last_recognized_plate = {}  # {cam_index: plate_text} – biển số cuối cùng theo từng làn
 last_recognized_time  = {}  # {cam_index: time_text}  – thời gian nhận diện theo từng làn
 
@@ -561,7 +574,7 @@ COLOR_MAP = {
     0: (0, 215, 255),   # vàng – biển số
 }
 
-DEFAULT_MODEL = "license-plate-finetune-v1n.onnx"   # ONNX plate detector (OpenVINO)
+DEFAULT_MODEL = os.getenv("PLATE_STREAM_MODEL", "license-plate-finetune-v1n_openvino_model")
 
 
 # ---------------------------------------------------------------------------
@@ -699,7 +712,19 @@ def draw_boxes(frame, sv_detections: sv.Detections, conf_threshold: float,
             # Chỉ trigger ALPR khi biển số trong vùng và đã có tracker_id
             if is_inside and track_id is not None:
                 cam_track_key = (cam_index, track_id)
-                if cam_track_key not in tracked_entered_ids:
+                now = time.time()
+
+                # Ghi thời điểm lần đầu biển số xuất hiện trong vùng
+                if cam_track_key not in track_id_first_in_region:
+                    track_id_first_in_region[cam_track_key] = now
+                    if REGION_DWELL_SECONDS > 0:
+                        print(f"[REGION] Biển số vào vùng, chờ {REGION_DWELL_SECONDS}s — Cam {cam_index+1} ID:{track_id}")
+
+                # Kiểm tra dwell time: phải đứng đủ N giây mới trigger
+                dwell_ok = (REGION_DWELL_SECONDS <= 0 or
+                            (now - track_id_first_in_region[cam_track_key]) >= REGION_DWELL_SECONDS)
+
+                if dwell_ok and cam_track_key not in tracked_entered_ids:
                     tracked_entered_ids.add(cam_track_key)
                     print(f"[REGION] Biển số mới vào vùng — Cam {cam_index+1} | ID:{track_id} | Conf:{conf:.2f} | Box:({x1},{y1})-({x2},{y2})")
                     sock_ip   = cam_info.get("socket_ip",  "")   if cam_info else ""
