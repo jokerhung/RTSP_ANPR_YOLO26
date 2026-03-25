@@ -1,34 +1,18 @@
 [
     {
-        "rtsp_url": "rtsp://admin:Vetc@2026@192.168.7.34/streaming/Channels/102",
-        "hkv_ip": "192.168.7.33",
+        "rtsp_url": "rtsp://admin:abcd1234@192.168.7.54:554/cam/realmonitor?channel=1&subtype=0",
+        "hkv_ip": "192.168.7.54",
         "hkv_user": "admin",
-        "hkv_pass": "Vetc@2026",
-        "hkv_snapshot_url": "http://{ip}/ISAPI/Streaming/channels/1/picture",
-        "region_points": [
-            [135, 469],
-            [838, 495],
-            [880, 664],
-            [118, 638]
+        "hkv_pass": "abcd1234",
+        "hkv_snapshot_url": "http://{ip}/cgi-bin/snapshot.cgi?channel=1&subtype=0",
+		"region_points": [
+            [265,497],
+            [1124,561],
+            [1128,456],
+            [25,346]
         ],
-        "socket_ip": "192.168.7.100",
-        "socket_port": 9000,
-        "min_box_height": 80
-    },
-    {
-        "rtsp_url": "rtsp://admin:Vetc@2026@192.168.7.48/streaming/Channels/102",
-        "hkv_ip": "192.168.7.47",
-        "hkv_user": "admin",
-        "hkv_pass": "Vetc@2026",
-        "hkv_snapshot_url": "http://{ip}/ISAPI/Streaming/channels/1/picture",
-        "region_points": [
-            [164, 446],
-            [888, 676],
-            [884, 492],
-            [274, 315]
-        ],
-        "socket_ip": "192.168.7.100",
+        "socket_ip": "127.0.0.1",
         "socket_port": 9001,
-        "min_box_height": 80
+		"min_box_height": 0
     }
 ]
