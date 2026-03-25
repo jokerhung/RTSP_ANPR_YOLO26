@@ -1,6 +1,6 @@
-open-image-models==0.5.1
-fast-plate-ocr==1.0.0
-fast-alpr==0.3.0
+open-image-models[onnx-openvino]==0.5.1
+fast-plate-ocr[onnx-openvino]==1.0.0
+fast-alpr[onnx-openvino]==0.3.0
 paddleocr==3.3.2
 paddlepaddle==3.2.2
 psutil==7.1.3
