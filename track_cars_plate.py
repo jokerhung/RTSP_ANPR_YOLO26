@@ -119,6 +119,7 @@ PLATE_DETECTOR_CONF = float(os.getenv("PLATE_DETECTOR_CONF", "0.25"))
 SKIP_FRAMES = int(os.getenv("SKIP_FRAMES", "2"))  # 1 = xử lý mọi frame (không bỏ qua)
 OV_DEVICE   = os.getenv("OV_DEVICE", "CPU")       # OpenVINO device: CPU | GPU | AUTO | NPU
 REGION_DWELL_SECONDS = float(os.getenv("REGION_DWELL_SECONDS", "0"))  # 0 = trigger ngay; >0 = phải đứng trong vùng đủ N giây
+REGION_TRIGGER_MODE = os.getenv("REGION_TRIGGER_MODE", "contain").strip().lower()  # contain = toàn bộ box trong vùng; intersect = box giao với vùng
 
 
 def _ov_device(requested: str) -> str:
@@ -683,31 +684,39 @@ def draw_boxes(frame, sv_detections: sv.Detections, conf_threshold: float,
             cx = (x1 + x2) // 2
             cy = (y1 + y2) // 2
 
-            # Kiểm tra xem bounding box có giao cắt/chạm vào vùng polygon không
-            pts_to_check = [
-                (float(cx), float(y2)),  # Giữa cạnh dưới
-                (float(cx), float(cy)),  # Tâm điểm
-                (float(x1), float(y2)),  # Góc dưới trái
-                (float(x2), float(y2)),  # Góc dưới phải
+            corners = [
                 (float(x1), float(y1)),  # Góc trên trái
                 (float(x2), float(y1)),  # Góc trên phải
-                (float(x1), float(cy)),  # Giữa cạnh trái
-                (float(x2), float(cy)),  # Giữa cạnh phải
+                (float(x1), float(y2)),  # Góc dưới trái
+                (float(x2), float(y2)),  # Góc dưới phải
             ]
-
-            is_inside = False
-            for pt in pts_to_check:
-                if cv2.pointPolygonTest(poly_pts, pt, False) >= 0:
-                    is_inside = True
-                    break
-
-            # Cẩn thận thêm: Nếu polygon nằm lọt thỏm giữa bounding box
-            if not is_inside:
-                for pt in poly_pts:
-                    px, py = pt[0]
-                    if x1 <= px <= x2 and y1 <= py <= y2:
-                        is_inside = True
-                        break
+            if REGION_TRIGGER_MODE == "contain":
+                # Toàn bộ bounding box phải nằm trong vùng polygon
+                is_inside = all(
+                    cv2.pointPolygonTest(poly_pts, pt, False) >= 0
+                    for pt in corners
+                )
+            else:
+                # Bounding box giao cắt/chạm vào vùng polygon là đủ
+                cx = (x1 + x2) // 2
+                cy = (y1 + y2) // 2
+                pts_to_check = corners + [
+                    (float(cx), float(cy)),   # Tâm điểm
+                    (float(cx), float(y1)),   # Giữa cạnh trên
+                    (float(cx), float(y2)),   # Giữa cạnh dưới
+                    (float(x1), float(cy)),   # Giữa cạnh trái
+                    (float(x2), float(cy)),   # Giữa cạnh phải
+                ]
+                is_inside = any(
+                    cv2.pointPolygonTest(poly_pts, pt, False) >= 0
+                    for pt in pts_to_check
+                )
+                # Trường hợp polygon nằm lọt thỏm bên trong bounding box
+                if not is_inside:
+                    is_inside = any(
+                        x1 <= pt[0][0] <= x2 and y1 <= pt[0][1] <= y2
+                        for pt in poly_pts
+                    )
 
             # Chỉ trigger ALPR khi biển số trong vùng và đã có tracker_id
             if is_inside and track_id is not None:
