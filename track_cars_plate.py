@@ -873,10 +873,26 @@ def run(source, model_path: str, conf: float, device: str):
 
 class RTSPReader:
     """
-    Đọc frame từ RTSP stream trong một thread riêng.
-    Giải quyết vấn đề buffer lag: chỉ giữ frame mới nhất,
-    bỏ qua các frame cũ chưa kịp xử lý.
+    Low-latency RTSP reader — ưu tiên FFmpeg subprocess pipe, fallback OpenCV.
+
+    Mode 1 (FFmpeg pipe — ưu tiên, delay thấp nhất):
+        ffmpeg process → raw BGR stdout → thread đọc pipe → self._frame
+        Ưu điểm: TOÀN BỘ flag low-latency áp dụng trực tiếp lên ffmpeg,
+                  không bị OpenCV VideoCapture buffer thêm.
+
+    Mode 2 (OpenCV VideoCapture — fallback khi không có ffmpeg trong PATH):
+        grab()+retrieve() loop trong thread riêng.
     """
+
+    # ── FFmpeg options cho OpenCV fallback ────────────────────────────────
+    _LL = ("fflags;nobuffer|flags;low_delay|max_delay;0"
+           "|reorder_queue_size;0|probesize;32|analyzeduration;0")
+    _HW_OPTIONS = [
+        f"rtsp_transport;tcp|{_LL}|video_codec;h264_qsv|hwaccel;qsv",
+        f"rtsp_transport;tcp|{_LL}|hwaccel;dxva2",
+        f"rtsp_transport;tcp|{_LL}",
+    ]
+
     def __init__(self, url: str, reconnect_delay: float = 3.0, read_fps: float = 60.0):
         self.url             = url
         self.reconnect_delay = reconnect_delay
@@ -884,78 +900,184 @@ class RTSPReader:
         self._lock           = threading.Lock()
         self._running        = False
         self._thread         = None
+        self._proc           = None          # subprocess handle (mode pipe)
         self.connected       = False
+        self.frames_grabbed  = 0
+        import shutil
+        self._use_pipe = shutil.which('ffmpeg') is not None
 
     def start(self):
         self._running = True
-        self._thread  = threading.Thread(target=self._read_loop, daemon=True)
+        tname = f"RTSPGrab:{self.url.split('@')[-1][:30]}"
+        self._thread = threading.Thread(target=self._run, daemon=True, name=tname)
         self._thread.start()
         return self
 
     def stop(self):
         self._running = False
+        # Kill ffmpeg subprocess ngay để unblock pipe read
+        if self._proc is not None:
+            try:
+                self._proc.terminate()
+            except Exception:
+                pass
         if self._thread:
             self._thread.join(timeout=5)
 
     def read(self):
-        """Trả về (True, frame) nếu có, ngược lại (False, None)."""
+        """Non-blocking. Trả về (True, frame_copy) hoặc (False, None)."""
         with self._lock:
             if self._frame is None:
                 return False, None
             return True, self._frame.copy()
 
-    def _read_loop(self):
-        # ----------------------------------------------------------------
-        # TCP transport + thử hardware decode (Intel DXVA2/QSV trên Windows)
-        # Software decode H264 1080p ~25fps có thể chiếm 40-80% 1 core CPU.
-        # Hardware decode chuyển việc đó sang GPU/iGPU → CPU gần bằng 0.
-        # ----------------------------------------------------------------
-        hw_options = [
-            # Ưu tiên 1: Intel QuickSync (iGPU Intel Arc/Iris)
-            "rtsp_transport;tcp|video_codec;h264_qsv|hwaccel;qsv",
-            # Ưu tiên 2: DirectX Video Acceleration (Windows generic)
-            "rtsp_transport;tcp|hwaccel;dxva2",
-            # Fallback: software decode thuần CPU (đã dùng trước đây)
-            "rtsp_transport;tcp",
-        ]
+    # ── Probe stream dimensions ──────────────────────────────────────────
+    def _probe_size(self):
+        """Mở VideoCapture ngắn chỉ để lấy (width, height), rồi release ngay."""
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = \
+            "rtsp_transport;tcp|fflags;nobuffer|probesize;32|analyzeduration;0"
+        cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
+        if not cap.isOpened():
+            return None, None
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cap.release()
+        return w, h
 
-        for hw_opt in hw_options:
+    # ── Dispatcher ───────────────────────────────────────────────────────
+    def _run(self):
+        if self._use_pipe:
+            print(f"[RTSP] Mode: FFmpeg subprocess pipe (lowest latency)")
+            self._run_pipe()
+        else:
+            print(f"[RTSP] Mode: OpenCV VideoCapture (ffmpeg binary not in PATH)")
+            self._run_opencv()
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Mode 1 — FFmpeg subprocess pipe (delay thấp nhất)
+    # ══════════════════════════════════════════════════════════════════════
+    def _run_pipe(self):
+        import subprocess
+        _CREATE_NO_WINDOW = 0x08000000     # Windows: ẩn cửa sổ console ffmpeg
+
+        while self._running:
+            # --- Probe kích thước stream ---
+            w, h = self._probe_size()
+            if w is None or h is None:
+                print(f"[RTSP] Probe thất bại → thử lại sau {self.reconnect_delay}s")
+                self.connected = False
+                time.sleep(self.reconnect_delay)
+                continue
+
+            frame_bytes = w * h * 3
+
+            cmd = [
+                'ffmpeg',
+                # ── Input flags (PHẢI trước -i) ──────────────────
+                '-fflags',             'nobuffer',
+                '-flags',              'low_delay',
+                '-max_delay',          '0',
+                '-reorder_queue_size', '0',
+                '-probesize',          '32',
+                '-analyzeduration',    '0',
+                '-rtsp_transport',     'tcp',
+                '-i',                  self.url,
+                # ── Output flags ─────────────────────────────────
+                '-an',                                  # bỏ audio
+                '-vsync', '0',                          # pass-through, không giữ frame
+                '-f', 'rawvideo', '-pix_fmt', 'bgr24',
+                '-',                                    # → stdout
+            ]
+
+            try:
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    bufsize=frame_bytes, creationflags=_CREATE_NO_WINDOW,
+                )
+            except FileNotFoundError:
+                print("[RTSP] ffmpeg binary không tìm thấy → chuyển sang OpenCV")
+                self._use_pipe = False
+                self._run_opencv()
+                return
+
+            self._proc = proc
+            self.connected = True
+            self.frames_grabbed = 0
+            print(f"[RTSP] FFmpeg pipe | {w}×{h} | {threading.current_thread().name}")
+
+            # ── Tight read loop ──────────────────────────────────────────
+            try:
+                while self._running:
+                    raw = proc.stdout.read(frame_bytes)
+                    if len(raw) < frame_bytes:
+                        break                              # EOF / broken pipe
+                    frame = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 3))
+                    self.frames_grabbed += 1
+                    with self._lock:
+                        self._frame = frame
+            except Exception as e:
+                print(f"[RTSP] Pipe error: {e}")
+            finally:
+                self._proc = None
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except Exception:
+                    proc.kill()
+                self.connected = False
+            # ── End read loop ────────────────────────────────────────────
+
+            if self._running:
+                print(f"[RTSP] Mất kết nối — thử lại sau {self.reconnect_delay}s "
+                      f"(đã đọc {self.frames_grabbed} frames)")
+                time.sleep(self.reconnect_delay)
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Mode 2 — OpenCV VideoCapture (fallback)
+    # ══════════════════════════════════════════════════════════════════════
+    def _open_cap(self):
+        """Thử hw-decode ưu tiên → fallback software. Trả về cap hoặc None."""
+        for hw_opt in self._HW_OPTIONS:
             os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = hw_opt
             cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
             if cap.isOpened():
-                label = hw_opt.split("|")[0].replace("rtsp_transport;tcp", "TCP")
                 hwaccel = hw_opt.split("hwaccel;")[-1] if "hwaccel" in hw_opt else "software"
-                print(f"[RTSP] Kết nối OK | decode={hwaccel}")
-                break
+                print(f"[RTSP] OpenCV OK | decode={hwaccel} | {self.url}")
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                return cap
             cap.release()
-        else:
-            # Tất cả đều thất bại
-            print(f"[RTSP] Không kết nối được: {self.url} → thử lại sau {self.reconnect_delay}s")
-            print(f"[RTSP] Gợi ý: Đảm bảo URL trong ngoặc kép khi chạy lệnh")
-            self.connected = False
-            time.sleep(self.reconnect_delay)
-            return
+        return None
 
-        # Giảm buffer còn 1 frame → không tích lũy frame cũ
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        self.connected = True
-
+    def _run_opencv(self):
         while self._running:
-            # Liên tục đọc để tránh nghẽn luồng RTSP gây nhòe hoặc lỗi ffmpeg "error while decoding"
-            ret, frame = cap.read()
-            if not ret:
-                print("[RTSP] Mất kết nối, đang tự kết nối lại...")
+            cap = self._open_cap()
+            if cap is None:
+                print(f"[RTSP] Không kết nối được → thử lại sau {self.reconnect_delay}s")
                 self.connected = False
-                cap.release()
                 time.sleep(self.reconnect_delay)
-                # Gọi đệ quy để thử lại từ đầu (kể cả thử lại hw decode)
-                self._read_loop()
-                return
+                continue
 
-            with self._lock:
-                self._frame = frame
+            self.connected = True
+            self.frames_grabbed = 0
+            print(f"[RTSP] OpenCV grab loop | {threading.current_thread().name}")
 
-        cap.release()
+            while self._running:
+                if not cap.grab():
+                    print("[RTSP] grab() thất bại — mất kết nối")
+                    break
+                ret, frame = cap.retrieve()
+                if not ret:
+                    continue
+                self.frames_grabbed += 1
+                with self._lock:
+                    self._frame = frame
+
+            self.connected = False
+            cap.release()
+            if self._running:
+                print(f"[RTSP] Mất kết nối — thử lại sau {self.reconnect_delay}s "
+                      f"(đã grab {self.frames_grabbed} frames)")
+                time.sleep(self.reconnect_delay)
 
 
 def run_rtsp(rtsp_urls: list, model_path: str, conf: float, device: str,
